@@ -1,0 +1,1174 @@
+---
+title: "PairedAnalysis: PoVsBL_LOW_HIGH"
+output: html_document
+date: "2024-10-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(edgeR)
+library(tidyverse)
+library(readxl)
+library(RColorBrewer)
+library(dplyr)
+library(ggplot2)
+library(data.table)
+library(ggrepel)
+library(pheatmap)
+library(writexl)
+library(viridis)
+library(fgsea)
+library(gggsea)
+```
+
+#Loading the sample info data and raw counts data
+```{r}
+## load the datasets into R
+sample_inf <- read_xls("Data_for_Sujoy_21ago24.xls") # sample data
+
+raw_counts <- read.delim("input_limma_fuentes_raw_counts_nodup_080624.txt") # raw count data
+
+```
+
+
+# Keep only the samples that match the low and high group in the sample data
+```{r}
+#extract the Patient_IDs that belong to groups low and high
+low_group_samples <- sample_inf %>% filter(Group_Cost_Weight_Gain == 'LOW_') %>% pull(Transcript_ID)
+high_group_samples <- sample_inf %>% filter(Group_Cost_Weight_Gain == 'HIGH') %>% pull(Transcript_ID)
+
+first_col <- colnames(raw_counts)[1] #extract the name of the first column from the raw_counts data
+
+#Identify column  names in raw_counts that match the samples in low_group_samples
+matched_low_grp_raw_counts <-  grep(paste(low_group_samples, collapse = "|"), colnames(raw_counts), value = TRUE)
+
+# Identify column names in raw_counts that match the samples in high_group_samples
+matched_high_grp_raw_counts <-  grep(paste(high_group_samples, collapse = "|"), colnames(raw_counts), value = TRUE)
+
+#create a combined list of low group column names to retain, including the first column and the matched columns
+combine_cols_low <- unique(c(first_col, matched_low_grp_raw_counts))
+
+#create a combined list of high group column names to retain, including the first column and the matched columns
+combine_cols_high <- unique(c(first_col, matched_high_grp_raw_counts))
+
+## subset the raw counts data to include only the selected low group columns
+low_raw_counts <- raw_counts %>%
+  dplyr::select(all_of(combine_cols_low))
+
+# subset the raw counts data to include only the selected high group columns
+high_raw_counts <- raw_counts %>%
+  dplyr::select(all_of(combine_cols_high))
+
+```
+
+# Filter sample data to include only low and high group data
+```{r}
+low_sample_data <- sample_inf %>% filter(Group_Cost_Weight_Gain != "in-between" & Group_Cost_Weight_Gain != "HIGH") # filter the sample data to include only low group data, excluding the "in-between" and "high" groups
+
+# Correct the spelling of "LOW_" to "LOW"
+low_sample_data$Group_Cost_Weight_Gain <- gsub("LOW_", "LOW", low_sample_data$Group_Cost_Weight_Gain)
+
+high_sample_data <- sample_inf %>% filter(Group_Cost_Weight_Gain != "in-between" & Group_Cost_Weight_Gain != "LOW_") # filter the sample data to include only high group data, excluding the "in-between" and "low" groups
+```
+
+
+## Differential gene expression analysis using limma voom in the low group
+```{r}
+# create a DGEList using the low group's raw counts data
+dge_low <- DGEList(counts = low_raw_counts) 
+
+dim(dge_low) # we have 61617 genes and 12 samples
+
+## TMM normalization 
+dge_low <- calcNormFactors(dge_low) 
+
+# log2 transformation of count data
+logcpm_low_counts <- cpm(dge_low$counts, log=TRUE, prior.count = 3)
+logcpm_low <- data.frame(Gene = dge_low$genes$gene, logcpm_low_counts)
+#write_xlsx(logcpm_low, "out_limma_logcpm_LOW_fuentes_study.xlsx")
+
+
+any(duplicated(dge_low$genes$gene)) # check if there's any duplicated gene symbols.
+
+# Extract sample names from low group's DGE list
+samplenames_low <- colnames(dge_low$counts)
+
+# Remove the existing group column in the DGE List 
+dge_low$samples <- dge_low$samples %>%
+  select(-group)
+
+# Assign new group values from low_sample_data to the DGE list's sample information
+dge_low$samples$Groups <- rep(low_sample_data$Group_Cost_Weight_Gain, each = 1, times = 2)
+
+## Filter out the low-quality genes
+keep_low <- rowSums(cpm(dge_low) >1)>=6
+dge_low <- dge_low[keep_low,, keep.lib.sizes = F] 
+length(rownames(dge_low$counts)) # 15116 genes remained after filtering
+```
+
+
+```{r}
+# Extract and factorize Patient IDs for paired samples in the low group
+Subject_low <- factor(substr(samplenames_low, 1, 5))
+Subject_low <- factor(Subject_low, levels = unique(Subject_low))
+
+# Define a mapping between substrings in sample names and their corresponding conditions
+label_to_condition <- c("PO" = "PO", "BL" = "BL")
+
+#function to map a sample name to its condition based on the mapping
+map_condition <- function(sample_name, label_to_condition){         
+  label <- substr(sample_name, nchar(sample_name) - 1, nchar(sample_name))
+  return(label_to_condition[label])
+}
+
+#  Apply the mapping function to all sample names in the low group
+conditions_low <- sapply(samplenames_low, map_condition, label_to_condition = label_to_condition)
+coldata_low <- data.frame(condition = conditions_low, row.names = samplenames_low) # store conditions(timepoints extracted from samplenames) with sample names as row names
+
+# Factorize the timepoints data in the low group
+Time <- factor(coldata_low$condition)
+low_group_data <- data.frame(Sample = samplenames_low, Time = Time, Group = dge_low$samples$Groups, Pair = Subject_low) #data frame combining sample names, timepoints, group information, and pairs data to run a paired analysis
+
+#create a design matrix for POvsBL_LOW comparison 
+design.low <- model.matrix(~0+Time+Pair, data = low_group_data)
+colnames(design.low) <- gsub("Time", "", colnames(design.low))
+colnames(design.low) <- gsub("Pair", "", colnames(design.low))
+rownames(design.low) <- low_group_data$Sample
+
+#Contrast matrix for POvsBL_LOW comparison 
+contr.matrix.low <- makeContrasts(
+  Low_Time = PO - BL,
+  levels = design.low)
+contr.matrix.low
+
+
+## Run voom
+v <- voom(dge_low, design.low, plot = T)
+fit <- lmFit(v, design.low)
+fit <- contrasts.fit(fit, contr.matrix.low)
+efit <- eBayes(fit)
+
+# Extract a table of top-ranked genes at FDR 0.05, 0.1 & 0.2 for POvsBL_LOW comparison
+LOW_POVsBL_FDR_1 <- topTable(efit, n = Inf, adjust.method = "fdr", sort.by = "P") # genes found for POvsBL_LOW comparison; no FDR threshold was given to this table
+#write.csvHIGH_POVsBL_FDR_1.out, "out_limma_low_POVsBL_fuentes_study.csv", row.names = F)
+LOW_PoVsBL_FDR_0.05 <- topTable(efit, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.05) # found 133 genes at fdr 0.05
+LOW_POVsBL_FDR_0.1 <- topTable(efit, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.1) #found 217 genes at fdr 0.1
+LOW_POVsBL_FDR_0.2 <- topTable(efit, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.2) # found 393 genes at fdr 0.2
+summary(decideTests(efit, adjust.method = "fdr", p.value = 0.05)) #shows upregulated and downregulated genes at fdr 0.05
+summary(decideTests(efit, adjust.method = "fdr", p.value = 0.1)) #shows upregulated and downregulated genes at fdr 0.1
+summary(decideTests(efit, adjust.method = "fdr", p.value = 0.2)) #shows upregulated and downregulatd genes at fdr 0.2
+
+# Plot the distribution of p-values for POvsBL_LOW comparison
+#jpeg("Hist_POVsBL_Low_pval_dist.jpeg", width = 2500, height = 1800, res = 300)
+hist(efit$p.value, main = "POVsBL_LOW")
+#dev.off()
+
+```
+
+
+## Volcano Plot for LOW group
+```{r}
+
+#jpeg("volcanoPlot_LOW_POvsBl_Fuentes_Study.jpeg", width = 2000, height = 1500, res = 300)
+## volcano plot for Time comparison in the LOW group (PO vs BL) - paired analysis
+ggplot(LOW_POVsBL_FDR_1, aes(x= logFC ,
+                     y=-log10(adj.P.Val), 
+                     color= -log10(adj.P.Val)))+
+  geom_point(size=2)+
+  geom_point(data=subset(LOW_POVsBL_FDR_1 %>% slice_min(adj.P.Val, n=20)),
+             aes(x= logFC, 
+                 y=-log10(adj.P.Val), 
+                 color= -log10(adj.P.Val)))+
+  scale_color_viridis(option="rocket", direction=1)+
+  geom_text_repel(data=subset(LOW_POVsBL_FDR_1 %>% slice_min(adj.P.Val, n=20)),
+                     aes(x=logFC, 
+                    y=-log10(adj.P.Val), 
+                     color= -log(adj.P.Val),label = gene), 
+                  color = "black", size=4, box.padding = unit(0.2, "lines"),segment.color="gray25",
+                  segment.size=0.25, point.padding = unit(0.2, "lines"), max.overlaps = Inf)+
+  geom_hline(yintercept=-log10(0.05), linetype="dashed") +
+  geom_vline(xintercept=c(1,-1),linetype="dashed")+
+  theme(panel.background = element_rect(fill = "white", colour = "black")) +
+  theme(axis.text = element_text (size = 10, face ="bold", colour = "black"))+
+  theme(axis.title = element_text (size = 18, face = "bold", colour = "black")) +
+  theme(strip.text = element_text(size=10, face="bold", color = "black"))+
+  ggtitle("volcanoPlot_Top20genes_LOW_POVsBL")+
+  theme(plot.title=element_text(face="bold"))+
+  xlab("log2FC (PO vs. BL)") +
+  ylab("-log10 FDR (PO vs. BL)")+
+  theme(legend.position="bottom") #to maximize graph space by removing legends
+
+#dev.off()
+
+```
+
+
+# Heatmap of top genes in the LOW group
+```{r}
+# Heatmap of top significant genes at FDR 0.05 for POvsBL_LOW comparison
+topgenes.low.filtered <- LOW_PoVsBL_FDR_0.05[LOW_PoVsBL_FDR_0.05$adj.P.Val < 0.05 & abs(LOW_PoVsBL_FDR_0.05$logFC) > 1, ] # filter genes with adjusted pval < 0.05 and abs log fold change >1
+i.1 <- efit$genes$gene[which(efit$genes$gene %in% topgenes.low.filtered$gene)] # Identify genes that overlap between efit and the filtered gene list
+
+#subset the logCPM data for the identified genes and remove the gene column
+data_low_time <- logcpm_low[logcpm_low$Gene %in% i.1, -1]
+rownames(data_low_time) <- i.1 #add the identified genes as rownames
+colnames(data_low_time)
+
+bl_samples_low <- grep("BL", colnames(data_low_time), value = TRUE)  # Extract BL sample names
+po_samples_low <- grep("PO", colnames(data_low_time), value = TRUE)  # Extract PO sample names
+
+# Reorder the columns such that BL and PO samples are grouped
+ordered_samples_low <- c(bl_samples_low, po_samples_low)
+
+#Reorder the data_hist_time columns according to the ordered_samples
+data_low_time <- data_low_time[, ordered_samples_low]
+
+#color palette
+my_palette <- colorRampPalette(c("blue", "white", "red"))(100)
+
+
+# create an annotation dataframe for the samples
+annot_col <- data.frame(Time.LOW = substr(colnames(data_low_time), 6, 7))
+rownames(annot_col) <- colnames(data_low_time)
+
+ann_colors <- list(
+  Time.LOW = c(BL = "#1B9E77", PO = "#D95F02")
+)
+
+
+#jpeg("Heatmap_LOW_POvsBL_Fuentes_Study.jpeg", width = 3800, height = 2800, res = 400)
+
+#generate heatmap for POvsBL_LOW comparison
+pheatmap(data_low_time, show_rownames = T, scale = "row", cluster_cols= F, cluster_rows = T, cex = 1.1, color = my_palette, fontsize_row =7 , fontsize_col = 10, border_color = NA, annotation_col = annot_col, annotation_colors = ann_colors, annotation_legend = T, main = "Topgenes_LOW_POVsBL_FDR_0.05")
+
+#dev.off()
+
+```
+
+
+# Perform Fast Gene Set Enrichment Analysis (FGSEA) using the Hallmark database
+```{r}
+
+# Load the hallmark db 
+hallmark <- gmtPathways("h.all.v2024.1.Hs.symbols.gmt")
+
+# View the pathways
+str(head(hallmark))
+
+# prepare ranked gene list for po vs bl within the LOW Group
+ranked_genes_low <- LOW_POVsBL_FDR_1$logFC
+names(ranked_genes_low) <- LOW_POVsBL_FDR_1$gene
+
+# Sort genes in decreasing order of logFC
+ranked_genes_low <- sort(ranked_genes_low, decreasing = TRUE)
+
+# View the ranked genes
+head(ranked_genes_low)
+
+
+# Run fgsea with the Hallmark pathways 
+FGSEA_hl_low <- fgsea(pathways = hallmark , # List of gene sets to check
+                 stats = ranked_genes_low,
+                  eps = 0,
+                 scoreType = 'std', 
+                 minSize = 15,
+                 maxSize = 250)
+
+#FGSEA_hl_low$leadingEdge <- sapply(FGSEA_hl_low$leadingEdge, function(x) paste(x, collapse=",")) #converting each element of Leading Edge into character string
+#write_xlsx(FGSEA_hl_low, "Fgsea_HallmarkPathway_POVsBL_LOW.xlsx")
+
+# Top 6 enriched pathways (ordered by p-val)
+head(FGSEA_hl_low[order(pval), ])
+
+sum(FGSEA_hl_low[, padj < 0.05]) #13 significant pathways 
+
+sum(FGSEA_hl_low[, pval < 0.05]) #15 significant pathways
+
+#select top pathways and create a table
+topPathwaysUp_hl_low <- FGSEA_hl_low[ES > 0  & padj < 0.05 ][head(order(padj), n = 5), pathway] # Extract the top 5 upregulated hallmark pathways at FDR 0.05
+topPathwaysDown_hl_low <- FGSEA_hl_low[ES < 0 & padj < 0.05 ][head(order(padj), n =5), pathway] # Extract the top 5 downregulated hallmark pathways at FDR 0.05
+topPathways_hl_low <- c(topPathwaysUp_hl_low, rev(topPathwaysDown_hl_low))
+plotGseaTable(hallmark[topPathways_hl_low], stats = ranked_genes_low, fgseaRes = FGSEA_hl_low, gseaParam = 0.5)
+
+# remove redundant pathways
+collapsedPathways_hl_low <- collapsePathways(FGSEA_hl_low[order(pval)][padj < 0.01], hallmark, ranked_genes_low, gseaParam = 1)  
+
+# plot the most significantly enriched pathway
+plotEnrichment(hallmark[[head(FGSEA_hl_low[order(padj), ], 1)$pathway]],
+               ranked_genes_low) + 
+  labs(title = head(FGSEA_hl_low[order(padj), ], 1)$pathway)
+
+# using gggsea to generate enrichment plots for top pathways (identified from fgsea above)
+
+# call selected pathways file
+setlist_hl_low = hallmark[topPathways_hl_low]
+
+# generate data for input into pathway images
+df_hl_low = gseaCurve(ranked_genes_low, setlist_hl_low, FGSEA_hl_low)
+
+#jpeg("HallmarkPathway_POvsBL_LOW_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+
+
+ggplot2::ggplot() +
+  geom_gsea(df_hl_low, linecolor = "darkgreen", zeroline = F, linesize = 1, labelsize = 2) +
+  theme_gsea(7) +
+  labs(title = "HallmarkPathway_POVsBL_LOW(FDR<=0.05)") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+
+
+#dev.off()
+```
+
+
+# Perform Fast Gene Set Enrichment Analysis (FGSEA) using the Wiki database
+```{r}
+# Load the wiki db
+Wiki <- gmtPathways("c2.cp.wikipathways.v2024.1.Hs.symbols.gmt")
+
+# View the pathways
+str(head(Wiki))
+
+# Run fgsea with the wiki pathways 
+FGSEA_Wk_low <- fgsea(pathways = Wiki , # List of gene sets to check
+                 stats = ranked_genes_low,
+                  eps = 0,
+                 scoreType = 'std', 
+                 minSize = 15,
+                 maxSize = 250)
+
+#FGSEA_Wk_low$leadingEdge <- sapply(FGSEA_Wk_low$leadingEdge, function(x) paste(x, collapse=",")) #converting each element of Leading Edge into character string
+#write_xlsx(FGSEA_Wk_low, "Fgsea_WikiPathway_POVsBL_LOW.xlsx")
+
+# Top 6 enriched pathways (ordered by p-val)
+head(FGSEA_Wk_low[order(pval), ])
+
+sum(FGSEA_Wk_low[, padj < 0.05]) #27 significant pathways 
+
+sum(FGSEA_Wk_low[, pval < 0.05]) #92 significant pathways
+
+#select top pathways and create a table
+topPathwaysUp_Wk_low <- FGSEA_Wk_low[ES > 0  & padj < 0.05 ][head(order(padj), n =5), pathway] # Extract the top 5 upregulated wiki pathways at FDR 0.05
+topPathwaysDown_Wk_low <- FGSEA_Wk_low[ES < 0  & padj < 0.05 ][head(order(padj), n = 5), pathway] # Extract the top 5 downregulated wiki pathways at FDR 0.05
+topPathways_Wk_low <- c(topPathwaysUp_Wk_low, rev(topPathwaysDown_Wk_low))
+plotGseaTable(Wiki[topPathways_Wk_low], stats = ranked_genes_low, fgseaRes = FGSEA_Wk_low, colwidths = c(5,3,0.8,1,1), gseaParam = 0.5)
+
+# remove redundant pathways
+collapsedPathways_Wk_low <- collapsePathways(FGSEA_Wk_low[order(pval)][padj < 0.01], Wiki, ranked_genes_low, gseaParam = 1)
+mainPathways_Wk_low <- FGSEA_Wk_low[pathway %in% collapsedPathways_Wk_low$mainPathways][order(-NES), pathway]
+plotGseaTable(Wiki[mainPathways_Wk_low], ranked_genes_low, FGSEA_Wk_low, gseaParam = 0.5)
+
+
+# plot the most significantly enriched pathway
+plotEnrichment(Wiki[[head(FGSEA_Wk_low[order(padj), ], 1)$pathway]],
+               ranked_genes_low ) + 
+  labs(title = head(FGSEA_Wk_low[order(padj), ], 1)$pathway) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"))
+
+# using gggsea to generate enrichment plots for top pathways (identified from fgsea above)
+
+# call selected pathways file
+setlist_Wk_low = Wiki[topPathways_Wk_low]
+
+# generate data for input into pathway images
+df_Wk_low = gseaCurve(ranked_genes_low, setlist_Wk_low, FGSEA_Wk_low)
+
+#jpeg("WikiPathway_POVsBL_LOW_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot2::ggplot() +
+  geom_gsea(df_Wk_low, linecolor = "darkgreen", zeroline = F, linesize = 1, labelsize = 2) +
+  theme_gsea(6) +
+  labs(title = "WikiPathway_POVsBL_LOW(FDR<=0.05)") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+
+#dev.off()
+```
+
+
+# Perform Fast Gene Set Enrichment Analysis (FGSEA) using the KEGG database
+```{r}
+# Load the Kegg database
+kegg <- gmtPathways("c2.cp.kegg_legacy.v2024.1.Hs.symbols.gmt")
+
+# View the pathways
+str(head(kegg))
+
+# Run fgsea with the kegg pathways 
+FGSEA_Kg_low <- fgsea(pathways = kegg , # List of gene sets to check
+                 stats = ranked_genes_low,
+                  eps = 0,
+                 scoreType = 'std', 
+                 minSize = 15,
+                 maxSize = 250)
+
+#FGSEA_Kg_low$leadingEdge <- sapply(FGSEA_Kg_low$leadingEdge, function(x) paste(x, collapse=",")) #converting each element of Leading Edge into character string
+#write_xlsx(FGSEA_Kg_low, "Fgsea_KEGGPathway_POVsBL_LOW.xlsx")
+
+# Top 6 enriched pathways (ordered by p-val)
+head(FGSEA_Kg_low[order(pval), ])
+
+sum(FGSEA_Kg_low[, padj < 0.05]) #11 significant pathways
+
+sum(FGSEA_Kg_low[, pval < 0.05]) #22 significant pathways
+
+#select top pathways and create a table
+topPathwaysUp_Kg_low <- FGSEA_Kg_low[ES > 0 & padj < 0.05 ][head(order(padj), n =5), pathway] #extract top 5 upregulated kegg pathways at FDR 0.05
+topPathwaysDown_Kg_low <- FGSEA_Kg_low[ES < 0 & padj < 0.05][head(order(padj), n = 5), pathway] # extract top 5 downregulated kegg pathways at FDR 0.05
+topPathways_Kg_low <- c(topPathwaysUp_Kg_low, rev(topPathwaysDown_Kg_low))
+plotGseaTable(kegg[topPathways_Kg_low], stats = ranked_genes_low, fgseaRes = FGSEA_Kg_low, colwidths = c(5,3,0.8,1,1), gseaParam = 0.5)
+
+# remove redundant pathways
+collapsedPathways_Kg_low <- collapsePathways(FGSEA_Kg_low[order(pval)][padj < 0.01], kegg, ranked_genes_low, gseaParam = 1)
+mainPathways_Kg_low <- FGSEA_Kg_low[pathway %in% collapsedPathways_Kg_low$mainPathways][order(-NES), pathway]
+plotGseaTable(kegg[mainPathways_Kg_low], ranked_genes_low, FGSEA_Kg_low, gseaParam = 0.5)
+
+
+# plot the most significantly enriched pathway
+plotEnrichment(kegg[[head(FGSEA_Kg_low[order(padj), ], 1)$pathway]],
+               ranked_genes_low ) + 
+  labs(title = head(FGSEA_Kg_low[order(padj), ], 1)$pathway) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"))
+
+# using gggsea to generate enrichment plots for top pathways (identified from fgsea above)
+
+# call selected pathways file
+setlist_Kg_low = kegg[topPathways_Kg_low]
+
+# generate data for input into pathway images
+df_Kg_low = gseaCurve(ranked_genes_low, setlist_Kg_low, FGSEA_Kg_low)
+
+#jpeg("KEGGPathway_POVsBL_LOW_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot2::ggplot() +
+  geom_gsea(df_Kg_low, linecolor = "darkgreen", zeroline = F, linesize = 1, labelsize = 2) +
+  theme_gsea(7) +
+  labs(title = "KEGGPathway_POVsBL_LOW(FDR<=0.05)") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+#dev.off()
+```
+
+# Barplot for Hallmark pathway for POVsBL comparison in low group
+```{r}
+top_pathways_hl_low <- FGSEA_hl_low[pathway %in% topPathways_hl_low][order(padj)] #pull the top pathways from hallmark db
+
+
+#jpeg("Barplot_HallmarkPathway_POVsBL_LOW_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+
+ggplot(top_pathways_hl_low) +
+  geom_col(aes(
+    x = reorder(pathway, NES),
+    y = NES,
+    fill = -log10(padj)
+  ), color = "black") +
+  coord_flip() +
+  scale_fill_distiller(palette = "Greens", direction = 1) +
+  theme(
+    axis.title = element_text(
+      size = 10,
+      face = "bold",
+      color = "black"
+    ),
+    axis.text = element_text(size = 8, color = "black"),
+    strip.text = element_text(
+      size = 9,
+      color = "black",
+      face = "bold"
+    ),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.line.x = element_line(color="gray30", linetype = "solid")
+  ) +
+  geom_hline (yintercept = 0, color="black", linetype = "solid")+
+  labs(y="Pathway Regulation (NES)", x="Pathway Name", 
+       title="Hallmark pathway database - POVsBL_LOW")
+#dev.off()
+
+```
+
+# Barplot for Wiki pathway for POVsBL comparison in low group
+```{r}
+top_pathways_wk_low <- FGSEA_Wk_low[pathway %in% topPathways_Wk_low][order(padj)] #pull the top pathways from wiki db
+
+
+#jpeg("Barplot_WikiPathway_POVsBL_LOW_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot(top_pathways_wk_low) +
+  geom_col(aes(
+    x = reorder(pathway, NES),
+    y = NES,
+    fill = -log10(padj)
+  ), color = "black") +
+  coord_flip() +
+  scale_fill_distiller(palette = "Greens", direction = 1) +
+  theme(
+    axis.title = element_text(
+      size = 10,
+      face = "bold",
+      color = "black"
+    ),
+    axis.text = element_text(size = 8, color = "black"),
+    strip.text = element_text(
+      size = 9,
+      color = "black",
+      face = "bold"
+    ),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.line.x = element_line(color="gray30", linetype = "solid")
+  ) +
+  geom_hline (yintercept = 0, color="black", linetype = "solid")+
+  labs(y="Pathway Regulation (NES)", x="Pathway Name", 
+       title="Wiki pathway database
+        POVsBL_LOW")
+#dev.off()
+
+```
+
+
+## Barplot for KEGG pathway for POVsBL comparison in low group
+```{r}
+top_pathways_Kg_low <- FGSEA_Kg_low[pathway %in% topPathways_Kg_low][order(padj)] #pull the top pathways from kegg db
+
+#jpeg("Barplot_KEGGPathway_POVsBL_LOW_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot(top_pathways_Kg_low) +
+  geom_col(aes(
+    x = reorder(pathway, NES),
+    y = NES,
+    fill = -log10(padj)
+  ), color = "black") +
+  coord_flip() +
+  scale_fill_distiller(palette = "Greens", direction = 1) +
+  theme(
+    axis.title = element_text(
+      size = 10,
+      face = "bold",
+      color = "black"
+    ),
+    axis.text = element_text(size = 8, color = "black"),
+    strip.text = element_text(
+      size = 9,
+      color = "black",
+      face = "bold"
+    ),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.line.x = element_line(color="gray30", linetype = "solid")
+  ) +
+  geom_hline (yintercept = 0, color="black", linetype = "solid")+
+  labs(y="Pathway Regulation (NES)", x="Pathway Name", 
+       title="KEGG pathway database - POVsBL_LOW")
+#dev.off()
+
+```
+
+
+## Differential gene expression analysis in the high group with outliers
+```{r}
+dge_high <- DGEList(counts = high_raw_counts) # create a DGEList using the high group's raw counts data
+
+dim(dge_high) # we have 61617 genes and 12 samples
+
+dge_high <- calcNormFactors(dge_high) ## TMM normalization 
+
+# log2 transformation of count data
+logcpm_high_counts <- cpm(dge_high$counts, log=TRUE, prior.count = 3)
+logcpm_high <- data.frame(Gene = dge_high$genes$gene, logcpm_high_counts)
+
+any(duplicated(dge_high$genes$gene)) # check if there's any duplicated gene symbols.
+
+# Extract sample names from DGE list
+samplenames_high <- colnames(dge_high$counts)
+
+# remove the existing group column from the DGE list
+dge_high$samples <- dge_high$samples %>%
+  select(-group)
+
+# Assign new group values from high_sample_data to the DGE list's sample information
+dge_high$samples$Groups <- rep(high_sample_data$Group_Cost_Weight_Gain, each = 1, times = 2)
+
+## Filter out the low-quality genes
+keep_high <- rowSums(cpm(dge_high) >1)>=6
+dge_high <- dge_high[keep_high,, keep.lib.sizes = F] 
+length(rownames(dge_high$counts)) # 14755 genes remained after filtering
+```
+
+
+
+```{r}
+# Extract and factorize Patient IDs for paired samples in the high group with outliers
+Subject_high <- factor(substr(samplenames_high, 1, 5))
+Subject_high <- factor(Subject_high, levels = unique(Subject_high))
+
+# Define a mapping between sample name substrings and their corresponding conditions
+label_to_condition <- c("PO" = "PO", "BL" = "BL")
+
+# Function to map sample names to its condition based on the mapping
+map_condition <- function(sample_name, label_to_condition){         
+  label <- substr(sample_name, nchar(sample_name) - 1, nchar(sample_name))
+  return(label_to_condition[label])
+}
+
+# Apply the mapping function to all sample namesin the high group with outliers
+conditions_high <- sapply(samplenames_high, map_condition, label_to_condition = label_to_condition)
+coldata_high <- data.frame(condition = conditions_high, row.names = samplenames_high)
+
+
+# factorize the timepoints data in the high group with outliers
+Time.high <- factor(coldata_high$condition)
+high_group_data <- data.frame(Sample = samplenames_high, Time = Time.high, Group = dge_high$samples$Groups, Pair = Subject_high) #dataframe combining sample names, timepoints, group informatin, and pairs data to run a paired analysis
+
+#create a design matrix for POvsBL_HIGH comparison (with outliers)
+design.high <- model.matrix(~0+Time+Pair, data = high_group_data)
+colnames(design.high) <- gsub("Time", "", colnames(design.high))
+colnames(design.high) <- gsub("Pair", "", colnames(design.high))
+rownames(design.high) <- high_group_data$Sample
+
+#Contrast matrix for POvsBL_HIGH comparison (with outliers)
+contr.matrix.high <- makeContrasts(
+  High_Time = PO - BL,
+  levels = design.high)
+contr.matrix.high
+
+
+## Run voom
+v1 <- voom(dge_high, design.high, plot = T)
+fit1 <- lmFit(v1, design.high)
+fit1 <- contrasts.fit(fit1, contr.matrix.high)
+efit1 <- eBayes(fit1)
+
+# Extract a table of top-ranked genes at FDR 0.05, 1, 0.1 & 0.2 for POvsBL_HIGH comparison (with outliers)
+HIGH_POVsBL_FDR_1 <- topTable(efit1, n = Inf, adjust.method = "fdr", sort.by = "P") # genes found for POvsBL_HIGH comparison; no FDR threshold was given to this table
+HIGH_PoVsBL_FDR_0.05 <- topTable(efit1, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.05) # found 5 genes at fdr 0.05
+HIGH_POVsBL_FDR_0.1 <- topTable(efit1, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.1) #found 10 genes at fdr 0.1
+HIGH_POVsBL_FDR_0.2 <- topTable(efit1, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.2) # found 13 genes at fdr 0.2
+summary(decideTests(efit1, adjust.method = "fdr", p.value = 0.05)) #shows upreg and downreg genes at fdr 0.05
+summary(decideTests(efit1, adjust.method = "fdr", p.value = 0.1)) #shows  upreg and downreg genes at fdr 0.1
+summary(decideTests(efit1, adjust.method = "fdr", p.value = 0.2)) #shows upreg and downreg genes at fdr 0.2
+
+```
+
+
+## Differential gene expression analysis in the high group without outliers
+```{r}
+high_raw_counts_out <- subset(high_raw_counts, select = -c(A9629PO, A9629BL)) # Remove outliers (samples A9629PO and A9629BL) from the high raw counts data
+
+dge_high_out <- DGEList(counts = high_raw_counts_out) # Create a DGEList object using the filtered high raw counts data
+
+dim(dge_high_out) # we have 61617 genes and 10 samples
+
+dge_high_out <- calcNormFactors(dge_high_out) ## TMM normalization 
+
+# log2 transformation of count data 
+logcpm_high_counts_out <- cpm(dge_high_out$counts, log=TRUE, prior.count = 3)
+logcpm_high_out <- data.frame(Gene = dge_high_out$genes$gene, logcpm_high_counts_out)
+#write_xlsx(logcpm_high_out, "out_limma_logcpm_HIGH_without_outliers_fuentes_study.xlsx")
+
+any(duplicated(dge_high_out$genes$gene)) # check if there's any duplicated gene symbols.
+
+# Extract sample names from high group (without outliers) DGE List
+samplenames_high_out <- colnames(dge_high_out$counts)
+
+# Remove the existing group column in the DGE List 
+dge_high_out$samples <- dge_high_out$samples %>%
+  select(-group)
+
+# Assign new group values from high_sample_data to the DGE list's sample information
+dge_high_out$samples$Groups <- rep(high_sample_data$Group_Cost_Weight_Gain, length.out =10)
+
+
+## Filter out the low-quality genes
+keep_high_out <- rowSums(cpm(dge_high_out) >1)>=5
+dge_high_out <- dge_high_out[keep_high_out,, keep.lib.sizes = F]
+length(rownames(dge_high_out$counts))  # 14909 genes remained after filtering
+```
+
+
+
+```{r}
+# Extract and factorize Patient IDs for paired samples in the high group without outliers
+Subject_high_out <- factor(substr(samplenames_high_out, 1, 5))
+Subject_high_out <- factor(Subject_high_out, levels = unique(Subject_high_out))
+
+# Define a mapping between substrings in sample names and their corresponding conditions
+label_to_condition <- c("PO" = "PO", "BL" = "BL")
+
+# Function to map sample names to its condition based on the mapping
+map_condition <- function(sample_name, label_to_condition){         
+  label <- substr(sample_name, nchar(sample_name) - 1, nchar(sample_name))
+  return(label_to_condition[label])
+}
+
+# Apply the mapping function to all sample names in the high group without outliers
+conditions_high_out <- sapply(samplenames_high_out, map_condition, label_to_condition = label_to_condition)
+coldata_high_out <- data.frame(condition = conditions_high_out, row.names = samplenames_high_out)
+
+
+# Factorize the timepoints data in the high group without outliers
+Time.high.out <- factor(coldata_high_out$condition)
+high_group_data_out <- data.frame(Sample = samplenames_high_out, Time = Time.high.out, Group = dge_high_out$samples$Groups, Pair = Subject_high_out) #data frame combining sample names, timepoints, group information, and pairs data to run a paired analysis
+
+# Create a design matrix for the POvsBL_HIGH comparison after removing outliers
+design.high.out <- model.matrix(~0+Time+Pair, data = high_group_data_out)
+colnames(design.high.out) <- gsub("Time", "", colnames(design.high.out))
+colnames(design.high.out) <- gsub("Pair", "", colnames(design.high.out))
+rownames(design.high.out) <- high_group_data_out$Sample
+
+#Contrast matrix for the POvsBL_HIGH comparison after removing outliers
+contr.matrix.high.out <- makeContrasts(
+  High_Time_out = PO - BL,
+  levels = design.high.out)
+contr.matrix.high.out
+
+
+## Run voom
+v1.out <- voom(dge_high_out, design.high.out, plot = T)
+fit1.out <- lmFit(v1.out, design.high.out)
+fit1.out <- contrasts.fit(fit1.out, contr.matrix.high.out)
+efit1.out <- eBayes(fit1.out)
+
+# Extract a table of top-ranked genes at FDR 0.05,0.1 & 0.2
+HIGH_POVsBL_FDR_1.out <- topTable(efit1.out, n = Inf, adjust.method = "fdr", sort.by = "P") # genes found for POvsBL_HIGH comparison after removing outliers ; no FDR threshold was given to this table
+#write.csv(HIGH_POVsBL_FDR_1.out, "out_limma_high_PoVsBL_fuentes_study.csv", row.names = F)
+HIGH_PoVsBL_FDR_0.05.out <- topTable(efit1.out, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.05) # found 8 genes at fdr 0.05
+HIGH_POVsBL_FDR_0.1.out <- topTable(efit1.out, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.1) #found 12 genes at fdr 0.1
+HIGH_POVsBL_FDR_0.2.out <- topTable(efit1.out, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.2) # found 15 genes at fdr 0.2
+summary(decideTests(efit1.out, adjust.method = "fdr", p.value = 0.05)) #shows the no of upreg and downreg genes at fdr 0.05
+summary(decideTests(efit1.out, adjust.method = "fdr", p.value = 0.1)) #shows the no of upreg and downreg genes at fdr 0.1
+summary(decideTests(efit1.out, adjust.method = "fdr", p.value = 0.2)) #shows the no of upreg and downreg genes at fdr 0.2
+
+# Plot the distribution of p-values for POvsBL_HIGH comparison after removing outliers
+#jpeg("Hist_POVsBL_High_pval_dist.jpeg", width = 2500, height = 1800, res = 300)
+hist(efit1.out$p.value, main = "POVsBL_High")
+#dev.off()
+
+```
+
+
+## Volcano Plot for HIGH group after removing outliers
+```{r}
+#jpeg("volcanoPlot_HIGH_POvsBl_Fuentes_Study.jpeg", width = 2000, height = 1500, res = 300)
+## volcano plot for POvsBL_HIGH comparison after removing outliers
+ggplot(HIGH_POVsBL_FDR_1.out, aes(x= logFC ,
+                     y=-log10(adj.P.Val), 
+                     color= -log10(adj.P.Val)))+
+  geom_point(size=2)+
+  geom_point(data=subset(HIGH_POVsBL_FDR_1.out %>% slice_min(adj.P.Val, n=20)),
+             aes(x= logFC, 
+                 y=-log10(adj.P.Val), 
+                 color= -log10(adj.P.Val)))+
+  #scale_color_manual(values = c("grey50", "darkred"))+
+  scale_color_viridis(option="rocket", direction=1)+
+  geom_text_repel(data=subset(HIGH_POVsBL_FDR_1.out %>% slice_min(adj.P.Val, n=20)),
+                     aes(x=logFC, 
+                    y=-log10(adj.P.Val), 
+                     color= -log10(adj.P.Val),label = gene), 
+                  color = "black", size=4, box.padding = unit(0.2, "lines"),segment.color="gray25",
+                  segment.size=0.25, point.padding = unit(0.2, "lines"), max.overlaps = Inf)+
+  geom_hline(yintercept=-log10(0.05), linetype="dashed") +
+  geom_vline(xintercept=c(1,-1),linetype="dashed")+
+  theme(panel.background = element_rect(fill = "white", colour = "black")) +
+  theme(axis.text = element_text (size = 10, face ="bold", colour = "black"))+
+  theme(axis.title = element_text (size = 18, face = "bold", colour = "black")) +
+  theme(strip.text = element_text(size=10, face="bold", color = "black"))+
+  ggtitle("volcanoPlot_Top20genes_HIGH_POVsBL")+
+  theme(plot.title=element_text(face="bold"))+
+  xlab("log2FC (PO vs. BL)") +
+  ylab("-log10 FDR (PO vs. BL)")+
+  theme(legend.position="bottom") #to maximize graph space by removing legends
+
+#dev.off()
+
+
+```
+
+# Heatmap of top genes for POvsBL_HIGH comparison after removing outliers
+```{r}
+# Heatmap of top significant genes at FDR 0.05 for POvsBL_HIGH comparison after removing the outliers
+topgenes.high.filtered <- HIGH_PoVsBL_FDR_0.05.out[HIGH_PoVsBL_FDR_0.05.out$adj.P.Val < 0.05 & abs(HIGH_PoVsBL_FDR_0.05.out$logFC) > 0.58, ]  # filter genes with adjusted pval < 0.05 and abs log fold change > 0.58
+i.2 <- efit1.out$genes$gene[which(efit1.out$genes$gene %in% topgenes.high.filtered$gene)]  # Identify genes that overlap between efit1.out and the filtered gene list
+
+#subset the logCPM data for the identified genes and remove the gene column
+data_high_time <- logcpm_high_out[logcpm_high_out$Gene %in% i.2, -1]
+rownames(data_high_time) <- i.2  #add the identified genes as rownames
+colnames(data_high_time)
+
+bl_samples_high <- grep("BL", colnames(data_high_time), value = TRUE)  # Extract BL sample names
+po_samples_high <- grep("PO", colnames(data_high_time), value = TRUE)  # Extract PO sample names
+
+# Reorder the columns such that BL and PO samples are grouped
+ordered_samples_high <- c(bl_samples_high, po_samples_high)
+
+#Reorder the data_hist_time columns according to the ordered_samples
+data_high_time <- data_high_time[, ordered_samples_high]
+
+#color palette
+my_palette <- colorRampPalette(c("blue", "white", "red"))(100)
+
+# create an annotation dataframe for the samples
+annot_col_high <- data.frame(Time.HIGH = substr(colnames(data_high_time), 6, 7))
+rownames(annot_col_high) <- colnames(data_high_time)
+
+ann_colors_high <- list(
+  Time.HIGH = c(BL = "#1B9E77", PO = "#D95F02")
+)
+
+
+#jpeg("Heatmap_HIGH_POvsBL_Fuentes_Study.jpeg", width = 3000, height = 1800, res = 400)
+
+#generate heatmap
+pheatmap(data_high_time, show_rownames = T, scale = "row", cluster_cols= F, cluster_rows = T, cex = 1.1, color = my_palette, fontsize_row =7 , fontsize_col = 10, border_color = NA, annotation_col = annot_col_high, annotation_colors = ann_colors_high, annotation_legend = T, main = "Topgenes_HIGH_POVsBL_FDR_0.05")
+
+#dev.off()
+
+```
+
+
+# Perform Fast Gene Set Enrichment Analysis (FGSEA) using the Hallmark database
+```{r}
+
+# prepare ranked gene list for po vs bl within the HIGH Group after removing the outliers
+ranked_genes_high <- HIGH_POVsBL_FDR_1.out$logFC
+names(ranked_genes_high) <- HIGH_POVsBL_FDR_1.out$gene
+
+# Sort genes in decreasing order of logFC
+ranked_genes_high <- sort(ranked_genes_high, decreasing = TRUE)
+
+# View the ranked genes
+head(ranked_genes_high)
+
+# Run fgsea with the hallmark pathways 
+FGSEA_hl_high <- fgsea(pathways = hallmark , # List of gene sets to check
+                 stats = ranked_genes_high,
+                  eps = 0,
+                 scoreType = 'std', 
+                 minSize = 15,
+                 maxSize = 250)
+
+#FGSEA_hl_high$leadingEdge <- sapply(FGSEA_hl_high$leadingEdge, function(x) paste(x, collapse=",")) #converting each element of Leading Edge into character string
+#write_xlsx(FGSEA_hl_high, "Fgsea_HallmarkPathway_POVsBL_HIGH.xlsx")
+
+# Top 6 enriched pathways (ordered by p-val)
+head(FGSEA_hl_high[order(pval), ])
+
+sum(FGSEA_hl_high[, padj < 0.05]) #0 significant pathways 
+
+sum(FGSEA_hl_high[, pval < 0.05]) #5 significant pathways
+
+#select top pathways and create a table
+topPathwaysUp_hl_high <- FGSEA_hl_high[ES > 0  & padj < 0.2 ][head(order(padj), n = 5), pathway] #extract the top 5 upreg hallmark pathways at fdr 0.2
+topPathwaysDown_hl_high <- FGSEA_hl_high[ES < 0 & padj < 0.2 ][head(order(padj), n =5), pathway] #extract the top 5 downreg hallmark pathways at fdr 0.2
+topPathways_hl_high <- c(topPathwaysUp_hl_high, rev(topPathwaysDown_hl_high))
+plotGseaTable(hallmark[topPathways_hl_high], stats = ranked_genes_high, fgseaRes = FGSEA_hl_high, gseaParam = 0.5)
+
+# remove redundant pathways
+collapsedPathways_hl_high <- collapsePathways(FGSEA_hl_high[order(pval)][padj < 0.01], hallmark, ranked_genes_high, gseaParam = 1) 
+
+# plot the most significantly enriched pathway
+plotEnrichment(hallmark[[head(FGSEA_hl_high[order(padj), ], 1)$pathway]],
+               ranked_genes_high) + 
+  labs(title = head(FGSEA_hl_high[order(padj), ], 1)$pathway)
+
+# using gggsea to generate enrichment plots for top pathways (identified from fgsea above)
+
+# call selected pathways file
+setlist_hl_high = hallmark[topPathways_hl_high]
+
+# generate data for input into pathway images
+df_hl_high = gseaCurve(ranked_genes_high, setlist_hl_high, FGSEA_hl_high)
+
+#jpeg("HallmarkPathway_POvsBL_HIGH_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+
+
+ggplot2::ggplot() +
+  geom_gsea(df_hl_high, linecolor = "darkgreen", zeroline = F, linesize = 1, labelsize = 2) +
+  theme_gsea(7) +
+  labs(title = "HallmarkPathway_POVsBL_HIGH(FDR<=0.2)") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+
+
+#dev.off()
+```
+
+
+# Perform Fast Gene Set Enrichment Analysis (FGSEA) using the Wiki database
+```{r}
+
+# Run fgsea with the wiki pathways 
+FGSEA_Wk_high <- fgsea(pathways = Wiki , # List of gene sets to check
+                 stats = ranked_genes_high,
+                  eps = 0,
+                 scoreType = 'std', 
+                 minSize = 15,
+                 maxSize = 250)
+
+#FGSEA_Wk_high$leadingEdge <- sapply(FGSEA_Wk_high$leadingEdge, function(x) paste(x, collapse=",")) #converting each element of Leading Edge into character string
+#write_xlsx(FGSEA_Wk_high, "Fgsea_WikiPathway_POVsBL_HIGH.xlsx")
+
+# Top 6 enriched pathways (ordered by p-val)
+head(FGSEA_Wk_high[order(pval), ])
+
+sum(FGSEA_Wk_high[, padj < 0.05]) #1 significant pathways 
+
+sum(FGSEA_Wk_high[, pval < 0.05]) #30 significant pathways
+
+#select top pathways and create a table
+topPathwaysUp_Wk_high <- FGSEA_Wk_high[ES > 0  & padj < 0.2 ][head(order(padj), n =5), pathway] #exract the top 5 wiki pathways at fdr 0.2
+topPathwaysDown_Wk_high <- FGSEA_Wk_high[ES < 0  & padj < 0.2 ][head(order(padj), n = 5), pathway] #extract the top 5 wiki pathways at fdr 0.2
+topPathways_Wk_high <- c(topPathwaysUp_Wk_high, rev(topPathwaysDown_Wk_high))
+plotGseaTable(Wiki[topPathways_Wk_high], stats = ranked_genes_high, fgseaRes = FGSEA_Wk_high, colwidths = c(5,3,0.8,1,1), gseaParam = 0.5)
+
+# remove redundant pathways
+collapsedPathways_Wk_high <- collapsePathways(FGSEA_Wk_high[order(pval)][padj < 0.01], Wiki, ranked_genes_high, gseaParam = 1)
+mainPathways_Wk_high <- FGSEA_Wk_high[pathway %in% collapsedPathways_Wk_high$mainPathways][order(-NES), pathway]
+plotGseaTable(Wiki[mainPathways_Wk_high], ranked_genes_high, FGSEA_Wk_high, gseaParam = 0.5)
+
+
+# plot the most significantly enriched pathway
+plotEnrichment(Wiki[[head(FGSEA_Wk_high[order(padj), ], 1)$pathway]],
+               ranked_genes_high ) + 
+  labs(title = head(FGSEA_Wk_high[order(padj), ], 1)$pathway) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"))
+
+# using gggsea to generate enrichment plots for top pathways (identified from fgsea above)
+
+# call selected pathways file
+setlist_Wk_high = Wiki[topPathways_Wk_high]
+
+# generate data for input into pathway images
+df_Wk_high = gseaCurve(ranked_genes_high, setlist_Wk_high, FGSEA_Wk_high)
+
+#jpeg("WikiPathway_POVsBL_HIGH_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot2::ggplot() +
+  geom_gsea(df_Wk_high, linecolor = "darkgreen", zeroline = F, linesize = 1, labelsize = 2) +
+  theme_gsea(7) +
+  labs(title = "WikiPathway_POVsBL_HIGH(FDR<=0.2)") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+
+#dev.off()
+```
+
+# Perform Fast Gene Set Enrichment Analysis (FGSEA) using the KEGG database
+```{r}
+# Run fgsea with the kegg pathways 
+FGSEA_Kg_high <- fgsea(pathways = kegg , # List of gene sets to check
+                 stats = ranked_genes_high,
+                  eps = 0,
+                 scoreType = 'std', 
+                 minSize = 15,
+                 maxSize = 250)
+
+#FGSEA_Kg_high$leadingEdge <- sapply(FGSEA_Kg_high$leadingEdge, function(x) paste(x, collapse=",")) #converting each element of Leading Edge into character string
+#write_xlsx(FGSEA_Kg_high, "Fgsea_KEGGPathway_POVsBL_HIGH.xlsx")
+
+# Top 6 enriched pathways (ordered by p-val)
+head(FGSEA_Kg_high[order(pval), ])
+
+sum(FGSEA_Kg_high[, padj < 0.05]) #1 significant pathways
+
+sum(FGSEA_Kg_high[, pval < 0.05]) #24 significant pathways
+
+#select top pathways and create a table
+topPathwaysUp_Kg_high <- FGSEA_Kg_high[ES > 0 & padj < 0.2 ][head(order(padj), n =5), pathway] #extract the top 5 kegg pathways at fdr 0.2
+topPathwaysDown_Kg_high <- FGSEA_Kg_high[ES < 0 & padj < 0.2][head(order(padj), n = 5), pathway] #extract the top 5 kegg pathways at fdr 0.2
+topPathways_Kg_high <- c(topPathwaysUp_Kg_high, rev(topPathwaysDown_Kg_high))
+plotGseaTable(kegg[topPathways_Kg_high], stats = ranked_genes_high, fgseaRes = FGSEA_Kg_high, colwidths = c(5,3,0.8,1,1), gseaParam = 0.5)
+
+# remove redundant pathways
+collapsedPathways_Kg_high <- collapsePathways(FGSEA_Kg_high[order(pval)][padj < 0.01], kegg, ranked_genes_high, gseaParam = 1)
+mainPathways_Kg_high <- FGSEA_Kg_high[pathway %in% collapsedPathways_Kg_high$mainPathways][order(-NES), pathway]
+plotGseaTable(kegg[mainPathways_Kg_high], ranked_genes_high, FGSEA_Kg_high, gseaParam = 0.5)
+
+
+# plot the most significantly enriched pathway
+plotEnrichment(kegg[[head(FGSEA_Kg_high[order(padj), ], 1)$pathway]],
+               ranked_genes_high ) + 
+  labs(title = head(FGSEA_Kg_high[order(padj), ], 1)$pathway) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"))
+
+# using gggsea to generate enrichment plots for top pathways (identified from fgsea above)
+
+# call selected pathways file
+setlist_Kg_high = kegg[topPathways_Kg_high]
+
+# generate data for input into pathway images
+df_Kg_high = gseaCurve(ranked_genes_high, setlist_Kg_high, FGSEA_Kg_high)
+
+#jpeg("KEGGPathway_POVsBL_HIGH_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot2::ggplot() +
+  geom_gsea(df_Kg_high, linecolor = "darkgreen", zeroline = F, linesize = 1, labelsize = 2) +
+  theme_gsea(7) +
+  labs(title = "KEGGPathway_POVsBL_HIGH(FDR<=0.2)") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+#dev.off()
+```
+
+
+# Barplot for Hallmark pathway for POVsBL in high group after removing the outliers
+```{r}
+
+top_pathways_hl_high <- FGSEA_hl_high[pathway %in% topPathways_hl_high][order(padj)] #pull the top pathways from hallmark db
+
+
+#jpeg("Barplot_HallmarkPathway_POVsBL_HIGH_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+
+ggplot(top_pathways_hl_high) +
+  geom_col(aes(
+    x = reorder(pathway, NES),
+    y = NES,
+    fill = -log10(padj)
+  ), color = "black") +
+  coord_flip() +
+  scale_fill_distiller(palette = "Greens", direction = 1) +
+  theme(
+    axis.title = element_text(
+      size = 10,
+      face = "bold",
+      color = "black"
+    ),
+    axis.text = element_text(size = 8, color = "black"),
+    strip.text = element_text(
+      size = 9,
+      color = "black",
+      face = "bold"
+    ),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.line.x = element_line(color="gray30", linetype = "solid")
+  ) +
+  geom_hline (yintercept = 0, color="black", linetype = "solid")+
+  labs(y="Pathway Regulation (NES)", x="Pathway Name", 
+       title="Hallmark pathway database - POVsBL_HIGH")
+#dev.off()
+
+```
+
+
+# Barplot for Wiki pathway for POVsBL in high group after removing the outliers
+```{r}
+top_pathways_wk_high <- FGSEA_Wk_high[pathway %in% topPathways_Wk_high][order(padj)] #pull the top pathways from wiki db
+
+
+#jpeg("Barplot_WikiPathway_POVsBL_HIGH_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot(top_pathways_wk_high) +
+  geom_col(aes(
+    x = reorder(pathway, NES),
+    y = NES,
+    fill = -log10(padj)
+  ), color = "black") +
+  coord_flip() +
+  scale_fill_distiller(palette = "Greens", direction = 1) +
+  theme(
+    axis.title = element_text(
+      size = 10,
+      face = "bold",
+      color = "black"
+    ),
+    axis.text = element_text(size = 8, color = "black"),
+    strip.text = element_text(
+      size = 9,
+      color = "black",
+      face = "bold"
+    ),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.line.x = element_line(color="gray30", linetype = "solid")
+  ) +
+  geom_hline (yintercept = 0, color="black", linetype = "solid")+
+  labs(y="Pathway Regulation (NES)", x="Pathway Name", 
+       title="Wiki pathway database
+        POVsBL_HIGH")
+#dev.off()
+
+```
+
+
+
+# Barplot for KEGG pathway for POVsBL in high group after removing the outliers
+```{r}
+top_pathways_Kg_high <- FGSEA_Kg_high[pathway %in% topPathways_Kg_high][order(padj)] #pull the top pathways from kegg db
+
+
+#jpeg("Barplot_KEGGPathway_POVsBL_HIGH_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot(top_pathways_Kg_high) +
+  geom_col(aes(
+    x = reorder(pathway, NES),
+    y = NES,
+    fill = -log10(padj)
+  ), color = "black") +
+  coord_flip() +
+  scale_fill_distiller(palette = "Greens", direction = 1) +
+  theme(
+    axis.title = element_text(
+      size = 10,
+      face = "bold",
+      color = "black"
+    ),
+    axis.text = element_text(size = 8, color = "black"),
+    strip.text = element_text(
+      size = 9,
+      color = "black",
+      face = "bold"
+    ),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.line.x = element_line(color="gray30", linetype = "solid")
+  ) +
+  geom_hline (yintercept = 0, color="black", linetype = "solid")+
+  labs(y="Pathway Regulation (NES)", x="Pathway Name", 
+       title="KEGG pathway database - POVsBL_HIGH")
+#dev.off()
+
+```
+
+
+## VennDiagram for DEGs common between POvsBL_LOW and POvsBL_HIGH without outliers comparisons
+```{r}
+## Differentially expressed genes that are common between the POvsBL_LOW and POvsBL_HIGH after removing the outliers comparisons at FDR 0.05
+LOW_POVsBL_dt_0.05 <- data.frame(decideTests(efit, adjust.method = "fdr", p.value = 0.05))
+HIGH_POVsBL_dt_0.05.out <- data.frame(decideTests(efit1.out, adjust.method = "fdr", p.value = 0.05))
+
+#  Extract genes for POvsBL_LOW with significant changes at fdr 0.05
+genes_low_0.05 <- dge_low$genes$gene[which(LOW_POVsBL_dt_0.05$Low_Time != 0)]
+
+# Extract genes for POvsBL_HIGH (without outliers) with significant changes at FDR  0.05
+genes_high_out_0.05 <- dge_high_out$genes$gene[which(HIGH_POVsBL_dt_0.05.out$High_Time_out != 0)]
+
+all_genes <- unique(c(dge_low$genes$gene, dge_high_out$genes$gene)) # Combine all unique genes from both groups
+
+# Create a binary matrix  indicating gene presence in each group
+gene_matrix <- matrix(0, nrow = length(all_genes), ncol = 2)
+rownames(gene_matrix) <- all_genes
+colnames(gene_matrix) <- c("POvsBL_LOW", "POvsBL_HIGH")
+
+# Assign 1 to the matrix for genes present in each group
+gene_matrix[all_genes %in% genes_low_0.05, "POvsBL_LOW"] <- 1
+gene_matrix[all_genes %in% genes_high_out_0.05, "POvsBL_HIGH"] <- 1
+
+#jpeg("VennDiagram_FDR_0.05.jpeg", width = 2500, height = 1800, res = 300)
+vennDiagram(gene_matrix, circle.col=c("turquoise", "salmon"))
+title(main = "POvsBL_LOW and POvsBL_HIGH DEG's at FDR 0.05", font = 4)
+#dev.off()
+
+
+```
+
+## VennDiagram data
+```{r}
+
+# Extract genes for each comparison and assign 1 for presence
+low_genes <- data.frame(Gene = genes_low_0.05) %>% 
+  mutate(POvsBL_LOW = 1)
+high_genes <- data.frame(Gene = genes_high_out_0.05) %>% 
+  mutate(POvsBL_HIGH = 1)
+
+# Combine datasets using full_join and fill missing values with 0 to indicate absence
+combined_gene_data <- full_join(low_genes, high_genes, by = "Gene") %>%
+  replace(is.na(.), 0)  # Replace NA values with 0
+#write_xlsx(combined_gene_data, "POvsBL_grps_venn_data.xlsx")
+
+```
+

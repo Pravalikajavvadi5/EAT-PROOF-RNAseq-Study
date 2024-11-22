@@ -1,0 +1,2521 @@
+---
+title: "Group Analysis - Fuentes Study"
+author: "Pravalika Javvadi"
+date: "2024-09-25"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(edgeR)
+library(tidyverse)
+library(readxl)
+library(RColorBrewer)
+library(dplyr)
+library(ggplot2)
+library(data.table)
+library(ggrepel)
+library(viridis)
+library(fgsea)
+library(gggsea)
+library(gplots)
+library(pheatmap)
+library(RColorBrewer)
+library(writexl)
+
+
+```
+
+
+#Loading the sample info data and raw counts data
+```{r}
+## load the datasets into R
+sample_inf <- read_xls("Data_for_Sujoy_21ago24.xls") #sample data 
+
+raw_counts <- read.delim("input_limma_fuentes_raw_counts_nodup_080624.txt") # raw count data
+
+```
+
+
+# Keep only the samples that match the low and high groups in the sample data
+```{r}
+#extract the Patient_ID's that belong to groups low and high
+low_group_samples <- sample_inf %>% filter(Group_Cost_Weight_Gain == 'LOW_') %>% pull(Transcript_ID)
+high_group_samples <- sample_inf %>% filter(Group_Cost_Weight_Gain == 'HIGH') %>% pull(Transcript_ID)
+
+# Extract the name of the first column from the raw_counts data
+first_col <- colnames(raw_counts)[1] 
+
+## Identify column names in raw_counts that match the samples in low_group_samples
+matched_low_grp_raw_counts <-  grep(paste(low_group_samples, collapse = "|"), colnames(raw_counts), value = TRUE)
+
+## Identify column names in raw_counts that match the samples in high_group_samples
+matched_high_grp_raw_counts <-  grep(paste(high_group_samples, collapse = "|"), colnames(raw_counts), value = TRUE)
+
+# Combine the matched low and high group column names into a single vector
+matched_low_high_grp_raw_counts <- c(matched_low_grp_raw_counts, matched_high_grp_raw_counts)
+
+# Create a combined list of column names to retain, including the first column and the matched columns
+combine_cols <- unique(c(first_col, matched_low_high_grp_raw_counts))
+
+# Subset the raw_counts data frame to include only the selected columns (low and high group data)
+new_raw_counts <- raw_counts %>%
+  dplyr::select(all_of(combine_cols))
+
+
+
+```
+
+
+# Do t-test to get find out the statistically significant phenotypes in the sample data
+```{r}
+# Separate the data into low and high groups
+#low <- subset(sample_inf, Group_Cost_Weight_Gain == 'LOW_')
+#high <- subset(sample_inf, Group_Cost_Weight_Gain == 'HIGH')
+
+# Perform t-test for bodyweight_basal_kg
+#t_test_bdywt <- t.test(low$Bodyweight_basal_kg, high$Bodyweight_basal_kg)
+#print("T-test results for body weight at baseline:")
+#print(t_test_bdywt)
+
+# Perform t-test for fat_mass_percent_basal
+#t_test_fat_mass <- t.test(low$Fat_mass_percent_basal, high$Fat_mass_percent_basal)
+#print("T-test results for fat mass percentage at baseline:")
+#print(t_test_fat_mass)
+
+# Perform t-test for BMI_basal
+#t_test_BMI <- t.test(low$BMI_basal, high$BMI_basal)
+#print("T-test results for BMI at baseline:")
+#print(t_test_BMI)
+
+# Perform t-test for Cost_weight_gain
+#t_test_Wtgain <- t.test(low$Cost_Weight_Gain, high$Cost_Weight_Gain)
+#print("T-test results for cost weight gain:")
+#print(t_test_Wtgain)
+
+```
+
+
+## Check the distribution of all the 12 samples (LOW samples = 6; HIGH samples = 6)
+```{r}
+new_sample_inf <- sample_inf %>% filter(Group_Cost_Weight_Gain != "in-between") #Filter the sample data to include only Low and High group data, excluding the "in-between" group
+
+# Save the filtered sample information as a CSV file
+#write.csv(new_sample_inf, "New_Sample_Data_Fuentes_Study.csv", row.names = F)
+
+cols_to_plot <- c("Bodyweight_basal_kg", "Fat_mass_percent_basal", "BMI_basal", "Cost_Weight_Gain") # columns to be plotted in QQ plots
+
+#jpeg("QQPlot_Fuentes_Study.jpeg", width = 2000, height = 1500, res = 300) 
+par(mfrow = c(2, 2), mar = c(2, 2, 2, 2))
+
+# Generate a QQplot for all the 12 samples
+for (column in cols_to_plot) {
+  qqnorm(new_sample_inf[[column]], main = paste("QQ plot for", column))
+  qqline(new_sample_inf[[column]], col = "red")
+}
+
+#dev.off()
+```
+
+
+## Differential gene expression analysis using limma voom
+```{r}
+# Create a DGEList using the modified raw counts data
+dge <- DGEList(counts = new_raw_counts)  # we have 61617 genes in total
+
+## TMM normalization 
+dge <- calcNormFactors(dge) 
+
+# Log2 transformation of count data 
+logcpm <- cpm(dge$counts, log=TRUE, prior.count = 3)
+
+# check if there's any duplicated gene symbols
+any(duplicated(dge$genes$gene))
+
+# Correct the spelling of "LOW_" to "LOW" in the Group_Cost_Weight_Gain column
+new_sample_inf$Group_Cost_Weight_Gain <- gsub("LOW_", "LOW", new_sample_inf$Group_Cost_Weight_Gain) 
+
+# Extract sample names from count data
+samplenames <- colnames(dge$counts)
+
+# Remove the "post" and "baseline" suffixes from the sample names
+modified_samples <- data.frame(modified_samples = substr(samplenames, 1, 5)) 
+
+# Match and merge the sample data with group information by aligning sample names (modified_samples) to Patient_ID
+samplenames_with_groups <- modified_samples %>%
+  left_join(new_sample_inf, by = c("modified_samples" = "Transcript_ID"))
+
+## Extract all the group information from the samples_with_groups dataframe
+mapped_groups <- data.frame(Groups = samplenames_with_groups$Group_Cost_Weight_Gain)
+
+# Add the extracted group data to DGELIST
+dge$samples$Groups <- mapped_groups$Groups
+
+# Discard the existing group column in the DGEList and replace it with the new group data
+dge$samples <- dge$samples %>%
+  select(-group)
+
+## Filter out the low-quality genes
+keep <- rowSums(cpm(dge) >1)>=12
+dge <- dge[keep,, keep.lib.sizes = F] 
+
+length(rownames(dge$counts)) # 14768 genes remained after filtering
+```
+
+
+```{r}
+# Calculate mean and median library sizes (in millions)
+L <- mean(dge$samples$lib.size) * 1e-6
+M <- median(dge$samples$lib.size) * 1e-6
+
+# Calculate log-cpm cutoff
+logcpm_cutoff <- log2(10/M + 2/L)
+
+#jpeg("Density_Plot_with_outliers.jpeg", width = 2000, height = 1500, res = 300)
+# Get sample count and assign colors
+nsamples <- ncol(dge)
+col <- brewer.pal(nsamples, "Dark2")
+par(mfrow=c(1,2))
+plot(density(logcpm[,1]), col=col[1], lwd=2, ylim=c(0,0.26), las=2, main="", xlab="") #Density Plot for raw data
+title(main=" Raw_data_Fuentes_Study", xlab="Log-cpm")
+abline(v=logcpm_cutoff, lty=3)
+for (i in 2:nsamples){
+den <- density(logcpm[,i])
+lines(den$x, den$y, col=col[i], lwd=2)
+}
+legend("topright", samplenames, text.col=col, bty="n")
+logcpm <- cpm(dge, log=TRUE, prior.count = 3)
+plot(density(logcpm[,1]), col=col[1], lwd=2, ylim=c(0,0.26), las=2, main="", xlab="") # Density Plot for filtered data
+title(main=" Filtered_data_Fuentes_Study", xlab="Log-cpm")
+abline(v=logcpm_cutoff, lty=3)
+for (i in 2:nsamples){
+den <- density(logcpm[,i])
+lines(den$x, den$y, col=col[i], lwd=2)
+}
+legend("topright", samplenames, text.col=col, bty="n")
+
+#dev.off()
+```
+
+
+```{r}
+#jpeg("MDSPlot_Fuentes_Study.jpeg", width = 2000, height = 1500, res = 300)
+
+## create MDS plot to check the variability in gene expression data
+plotMDS(logcpm, labels = dge$samples$Groups, col = ifelse(dge$samples$Groups == "LOW", "blue", "red"), cex = 1)
+
+#dev.off()
+
+```
+
+
+```{r}
+## Principal Component Analysis
+data <- data.table(logcpm) # convert logcpm matrix to a data table obj
+tdata <- data.table::transpose(data) # transpose the data table
+colnames(tdata) <- rownames(logcpm) #set colnames of the transposed data
+rownames(tdata) <- colnames(logcpm) #set rownames of the transposed data
+
+pca <- prcomp(tdata, scale. = T) # pca on transposed data
+
+#jpeg("Screeplot_with_outliers_Fuentes_Study.jpeg",width = 2000, height = 1500, res = 300)
+
+##screeplot pca
+screeplot(pca)
+
+#dev.off()
+
+## proportion of variance explained by each component
+summary(pca)
+
+pca_data <- data.frame(pca$x) # convert principal component values to a dataframe obj
+pca_data$Group <- dge$samples$Groups #Add the groups column to pca dataframe
+
+# Assign colors to groups
+unique_groups <- unique(dge$samples$Groups)
+colors <- brewer.pal(length(unique_groups), "Set1")
+pca_data$Color <- colors[as.numeric(factor(pca_data$Group, levels = unique_groups))]
+
+#jpeg("Pca_Fuentes_Study.jpeg",width = 2000, height = 1500, res = 300)
+
+# Plot PCA
+ggplot(data=pca_data, aes(x=PC1, y=PC2)) +
+  geom_point(size=5, aes(color=Group))+
+  geom_hline(yintercept=0, colour="black", linetype="dashed") +
+  geom_vline(xintercept=0, colour="black", linetype="dashed") +
+  geom_text_repel(label=rownames(tdata), colour="black", size=3, nudge_x=0.1, nudge_y=0.1, max.overlaps = Inf) +  
+  xlab("PC1 (12%)")+
+  ylab("PC2(9.3%)")+ 
+  theme(axis.text=element_text(size=14, colour="black"),axis.title=element_text(size=14, face="bold", colour="black")) + 
+  theme(panel.background = element_rect(fill = "white", colour = 'black'))+
+  ggtitle("PCA_plot_with_outliers_Fuentes_Study")
+
+#dev.off()
+```
+
+
+## Differential expression analysis with outlier data
+```{r}
+
+##---------------------------Time Comparison (POVsBL)-------------------------------------------------------##
+
+# Extract and factorize Patient IDs for paired samples
+Subject <- factor(substr(samplenames, 1, 5))
+Subject <- factor(Subject, levels = unique(Subject))
+ 
+# Define a mapping between sample name substrings and condition
+label_to_condition <- c("PO" = "PO", "BL" = "BL")
+
+# Function to map sample names to its condition based on the mapping
+map_condition <- function(sample_name, label_to_condition){         
+  label <- substr(sample_name, nchar(sample_name) - 1, nchar(sample_name))
+  return(label_to_condition[label])
+}
+
+# Apply the mapping function to all sample names
+conditions <- sapply(samplenames, map_condition, label_to_condition = label_to_condition)
+coldata <- data.frame(condition = conditions, row.names = samplenames) #store conditions (timepoints extracted from samplenames) with sample names as row names
+
+# Factorize the timepoints data for paired analysis
+Time <- factor(coldata$condition)
+sample_paired_data <- data.frame(Sample = samplenames, Time = Time, Pair = Subject) #Paired analysis sample data
+
+#create a design matrix for time comparison (POvsBL_ALL)
+design <- model.matrix(~0+Time+Pair, data = sample_paired_data)
+colnames(design) <- gsub("Time", "", colnames(design))
+colnames(design) <- gsub("Pair", "", colnames(design))
+rownames(design) <- sample_paired_data$Sample
+
+#Contrast matrix for time comparison (POvsBL_ALL)
+contr.matrix <- makeContrasts(
+  Time = PO - BL,
+  levels = design)
+contr.matrix
+
+
+## Run voom
+v <- voom(dge, design, plot = T)
+fit <- lmFit(v, design)
+fit <- contrasts.fit(fit, contr.matrix)
+efit <- eBayes(fit)
+
+# Extract a table of top-ranked genes at FDR 0.05, 0.1 & 0.2
+POVsBL_FDR_1 <- topTable(efit, n = Inf, adjust.method = "fdr", sort.by = "P") # genes found for POvsBL_ALL comparison ; no FDR threshold was given to this table
+PoVsBL_FDR_0.05 <- topTable(efit, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.05) # found 193 genes at fdr 0.05
+POVsBL_FDR_0.1 <- topTable(efit, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.1) #found 346 genes at fdr 0.1
+POVsBL_FDR_0.2 <- topTable(efit, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.2) # found 650 genes at fdr 0.2
+summary(decideTests(efit, adjust.method = "fdr", p.value = 0.05)) #shows the no of upreg and downreg genes at fdr 0.05
+summary(decideTests(efit, adjust.method = "fdr", p.value = 0.1)) #shows the no of upreg and downreg genes at fdr 0.1
+summary(decideTests(efit, adjust.method = "fdr", p.value = 0.2)) #shows the no of upreg and downreg genes at fdr 0.2
+
+##-------------------------HIGHvsLOW_Both, HIGHvsLOW_BL, HIGHvsLOW_PO and HIGHvsLOW_Intxn comparisons--------------------##
+
+#create a combined factor for timepoints (BL,PO) and groups (HIGH,LOW)
+Time.Grp <- paste(dge$samples$Groups, coldata$condition, sep = "_")
+Group <- factor(dge$samples$Groups) #factor the group data from DGE list
+sample_unpaired_data <- data.frame(Sample = samplenames, Time = Time, WTgain_sens = Group, Time.WTgain_sens = Time.Grp) #Unpaired samples data
+
+# design matrix for unpaired analysis
+design1 <- model.matrix(~0 + Time.WTgain_sens, data = sample_unpaired_data)
+colnames(design1) <- gsub("Time.WTgain_sens", "", colnames(design1))
+rownames(design1) <- sample_unpaired_data$Sample
+
+# contrast matrix for unpaired analysis
+contrast <- makeContrasts(
+  WeightGain_senstivity = (HIGH_BL + HIGH_PO)/2 - (LOW_BL + LOW_PO)/2,
+  BL_Difference_grps = HIGH_BL - LOW_BL,
+  PO_Difference_grps = HIGH_PO - LOW_PO,
+  Interaction =  (HIGH_BL - HIGH_PO) - (LOW_BL - LOW_PO),
+  levels = design1)
+contrast
+
+# Run voom on unpaired analysis
+v1 <- voom(dge, design1, plot = T)
+fit1 <- lmFit(v1, design1)
+fit1 <- contrasts.fit(fit1, contrast)
+efit1 <- eBayes(fit1)
+
+# Extract a table of top-ranked genes for HIGHvsLOW_Both, HIGHvsLOW_BL, HIGHvsLOW_PO and HIGHvsLOW_Intxn comparisons
+WTgain_sens_FDR_1 <- topTable(efit1, coef = 1, n = Inf, adjust.method = "fdr", sort.by = "P") # genes found for HIGHvsLOW_Both comparison ; no FDR threshold was given to this table
+BL_diff_FDR_1 <- topTable(efit1, coef = 2, n = Inf, adjust.method = "fdr", sort.by = "P") # genes found for HIGHvsLOW_BL comparison; no FDR threshold was given to this table
+PO_diff_FDR_1 <- topTable(efit1, coef = 3, n = Inf, adjust.method = "fdr", sort.by = "P") # genes found for HIGHvsLOW_PO comparison' no FDR threshold was given to this table
+Int_FDR_1 <- topTable(efit1, coef = 4 , n = Inf, adjust.method = "fdr", sort.by = "P") # genes found for HIGHvsLOW_Intxn comparison ; no FDR threshold was given to this table
+
+
+# Extract a table of top-ranked genes found at FDR 0.05 for HIGHvsLOW_Both, HIGHvsLOW_BL, HIGHvsLOW_PO and HIGHvsLOW_Intxn comparisons
+topTable(efit1, coef = 1, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.05) # no genes were found for HIGHvsLOW_Both comparison at fdr 0.05
+topTable(efit1, coef = 2, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.05) # no genes were found for HIGHvsLOW_BL at FDR 0.05
+topTable(efit1, coef = 3, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.05) # no genes were found for HIGHvsLOW_PO at FDR 0.05
+topTable(efit1, coef = 4, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.05) # no genes were found for HIGHvsLOW_Intxn at FDR 0.05
+summary(decideTests(efit1, adjust.method = "fdr", p.value = 0.05))# shows the upregulated and downregulated genes for all the 4 comparisons that are FDR adjusted at 0.05
+
+
+
+# Extract a table of top-ranked genes found at  FDR 0.1 for HIGHvsLOW_Both, HIGHvsLOW_BL, HIGHvsLOW_PO and HIGHvsLOW_Intxn comparisons
+WTgain_sens_FDR_0.1 <- topTable(efit1, coef = 1, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.1) # 4 genes were found for HIGHvsLOW_Both comparison at FDR 0.1
+topTable(efit1, coef = 2, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.1) # no genes were found for HIGHvsLOW_BL comparison at FDR 0.1
+topTable(efit1, coef = 3, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.1) # no genes were found for HIGHvsLOW_PO comparison at FDR 0.1
+topTable(efit1, coef = 4, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.1) # no genes were found for HIHGvsLOW_Intxn comparison at FDR 0.1
+summary(decideTests(efit1, adjust.method = "fdr", p.value = 0.1)) # check the upregulated and downregulated genes for all the 4 comparisons that are FDR adjusted at 0.1
+
+
+# Extract a table of top-ranked genes at FDR 0.2 for HIGHvsLOW_Both, HIGHvsLOW_BL, HIGHvsLOW_PO and HIGHvsLOW_Intxn comparison
+WTgain_sens_FDR_0.2 <- topTable(efit1, coef = 1, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.2) # In HIGHvsLOW_Both comparison, 90 genes were found at FDR 0.2
+topTable(efit1, coef = 2, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.2) # no genes were found for HIGHvsLOW_BL comparison at FDR 0.2
+topTable(efit1, coef = 3, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.2) #no genes were found for HIGHvsLOW_PO comparison at FDR 0.2
+topTable(efit1, coef = 4, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.2) # no genes were found for HIHGvsLOW_Intxn comparison at FDR 0.2
+summary(decideTests(efit1, adjust.method = "fdr", p.value = 0.2)) # check the upregulated and downregulated genes for all the 4 comparisons that are FDR adjusted at 0.2
+
+##------DEG's common between POvsBL_ALL and HIGHvsLOW_Both comparison & Venn Diagrams for the unpaired analysis comparisons---------
+
+# DEGs common between POvsBL_ALL and HIGHvsLOW_Both comparisons at FDR 0.05 
+paired_dt_0.05 <- data.frame(decideTests(efit, adjust.method = "fdr", p.value = 0.05))
+unpaired_dt_0.05 <- data.frame(decideTests(efit1, adjust.method = "fdr", p.value = 0.05))
+dt_0.05 <- data.frame(Time = paired_dt_0.05$Time, HIGHvsLOW_Both = unpaired_dt_0.05$WeightGain_senstivity, HIGHvsLOW_BL = unpaired_dt_0.05$BL_Difference_grps, HIGHvsLOW_PO = unpaired_dt_0.05$PO_Difference_grps, HIGHvsLOW_Intxn = unpaired_dt_0.05$Interaction)
+de.common_0.05 <- which(dt_0.05[,1]!=0 & dt_0.05[,2]!=0)
+head(efit$genes$gene[de.common_0.05]) # no genes were common - paired analysis
+head(efit1$genes$gene[de.common_0.05]) # no genes were common - unpaired analysis
+
+## vennDiagram for unpaired analysis DEGs at FDR 0.05
+#jpeg("VennDiagram_FDR_0.05_with_outliers.jpeg", width = 2500, height = 1800, res = 400)
+vennDiagram(dt_0.05[,2:5], circle.col=c("turquoise", "salmon", "violet", "darkgreen"), cex = 0.9)
+title(main = "Unpaired Analysis DEGs at FDR 0.05 with outliers", font = 2)
+#dev.off()
+
+# DEGs common between POvsBL_ALL and HIGHvsLOW_Both comparisons at FDR 0.1
+paired_dt_0.1 <- data.frame(decideTests(efit, adjust.method = "fdr", p.value = 0.1)) # paired analysis
+unpaired_dt_0.1 <- data.frame(decideTests(efit1, adjust.method = "fdr", p.value = 0.1))# unpaired analysis 
+dt_0.1 <- data.frame(Time = paired_dt_0.1$Time, HIGHvsLOW_Both = unpaired_dt_0.1$WeightGain_senstivity, HIGHvsLOW_BL = unpaired_dt_0.1$BL_Difference_grps, HIGHvsLOW_PO = unpaired_dt_0.1$PO_Difference_grps, HIGHvsLOW_Intxn = unpaired_dt_0.1$Interaction)
+de.common_0.1 <- which(dt_0.1[,1]!= 0 & dt_0.1[,2]!=0)
+head(efit$genes$gene[de.common_0.1]) # 3 genes were found to be common between POvsBL_ALL and HIGHvsLOW_Both comparisons
+head(efit1$genes$gene[de.common_0.1])
+
+## vennDiagram for unpaired analysis DEGs at at FDR 0.1
+#jpeg("VennDiagram_FDR_0.1_with_outliers.jpeg", width = 2500, height = 1800, res = 400)
+vennDiagram(dt_0.1[, 2:5], circle.col=c("turquoise", "salmon", "violet", "darkgreen"), cex = 0.9)
+title(main = "Unpaired Analysis DEGs at FDR 0.1 with outliers", font = 2)
+#dev.off()
+
+#DEGs common between POvsBL_ALL and HIGHvsLOW_Both comparisons at FDR 0.2
+paired_dt_0.2 <- data.frame(decideTests(efit, adjust.method = "fdr", p.value = 0.2))
+unpaired_dt_0.2 <- data.frame(decideTests(efit1, adjust.method = "fdr", p.value = 0.2))
+dt_0.2 <- data.frame(Time = paired_dt_0.2$Time, HIGHvsLOW_Both = unpaired_dt_0.2$WeightGain_senstivity, HIGHvsLOW_BL = unpaired_dt_0.2$BL_Difference_grps, HIGHvsLOW_PO = unpaired_dt_0.2$PO_Difference_grps, HIGHvsLOW_Intxn = unpaired_dt_0.2$Interaction)
+de.common_0.2 <- which(dt_0.2[,1]!= 0 & dt_0.2[,2]!=0)
+head(efit$genes$gene[de.common_0.2]) # 27 genes were found to be common between POvsBL_ALL and HIGHvsLOW_Both comparisons
+head(efit1$genes$gene[de.common_0.2])
+
+## vennDiagram for unpaired analysis DEGs at FDR 0.2
+#jpeg("VennDiagram_FDR_0.2_with_outliers.jpeg", width = 2500, height = 1800, res = 400)
+vennDiagram(dt_0.2[,2:5], circle.col=c("turquoise", "salmon", "violet", "darkgreen"), cex = 0.9)
+title(main = "Unpaired Analysis DEGs at FDR 0.2 with outliers", font = 2)
+#dev.off()     
+```
+
+
+## PCA Plot after removing outliers
+```{r}
+data_out <- data.table(logcpm) # convert logcpm matrix to a data table obj
+data_out <- subset(data_out, select = -c(A9629PO, A9629BL)) #discard the outlier samples from the data
+
+tdata_out <- data.table::transpose(data_out)  # transpose the data table
+colnames(tdata_out) <- rownames(logcpm) #set colnames of the transposed data
+rownames(tdata_out) <- colnames(data_out) #set rownames of the transposed data
+
+tdata_samples_out <- rownames(tdata_out)
+
+# discard the post and baseline info from the samplenames
+samples_out <- data.frame(samples = substr(tdata_samples_out, 1, 5))
+
+## Match and merge the sample data with the modified group information by aligning sample names to Patient_ID
+tdata_samplenames_with_groups_out <- samples_out %>%
+  left_join(new_sample_inf, by = c("samples" = "Transcript_ID"))
+
+# Extract the modified group information (without outlier data) to a new df
+groups_out <- data.frame(Groups = tdata_samplenames_with_groups_out$Group_Cost_Weight_Gain)
+
+pca_out <- prcomp(tdata_out, scale. = T)
+
+#jpeg("Screeplot_without_outliers_Fuentes_Study.jpeg", width = 2000, height = 1500, res = 300) 
+
+##screeplot
+screeplot(pca_out)
+
+#dev.off()
+
+## proportion of variance explained by each component
+summary(pca_out)
+
+pca_data_out <- data.frame(pca_out$x) # convert principal component values to a dataframe obj
+pca_data_out$Groups <- groups_out$Groups #Add the groups column to pca dataframe
+
+# Assign colors to groups
+unique_groups_out <- unique(groups_out$Groups)
+colors_out <- brewer.pal(length(unique_groups_out), "Set1")
+pca_data_out$Color <- colors_out[as.numeric(factor(pca_data_out$Groups, levels = unique_groups_out))]
+
+#jpeg("Pca_out_Fuentes_Study.jpeg", width = 2000, height = 1500, res = 300)
+
+# Plot PCA
+ggplot(data=pca_data_out, aes(x=PC1, y=PC2)) +
+  geom_point(size=5, aes(color=Groups))+
+  geom_hline(yintercept=0, colour="black", linetype="dashed") +
+  geom_vline(xintercept=0, colour="black", linetype="dashed") +
+  geom_text_repel(label=tdata_samples_out, colour="black", size=3, nudge_x=0.1, nudge_y=0.1, max.overlaps = Inf) +  
+  xlab("PC1(11%)")+
+  ylab("PC2(8%)")+ 
+  theme(axis.text=element_text(size=14, colour="black"),axis.title=element_text(size=14, face="bold", colour="black")) + 
+  theme(panel.background = element_rect(fill = "white", colour = 'black'))+
+  ggtitle("PCA_plot_without_outliers_Fuentes_Study")
+
+#dev.off()
+
+
+```
+
+
+## Create a new DGE List without the outliers
+```{r}
+new_raw_counts_out <- subset(new_raw_counts, select = -c(A9629PO, A9629BL)) # create a new raw counts data by removing the outlier samples
+
+# create a new DGE List without the outlier samples
+dge_out <- DGEList(counts = new_raw_counts_out) # 61617 genes in total
+
+## TMM normalization
+dge_out <- calcNormFactors(dge_out) 
+
+#log transformation of count data
+logcpm_counts_out <- cpm(dge_out$counts, log = TRUE, prior.count = 3)
+logcpm_out <- data.frame(Gene = dge_out$genes$gene, logcpm_counts_out)
+#write_xlsx(logcpm_out, "out_limma_logcpm_fuentes_study.xlsx")
+
+
+dge_samples_out <- colnames(dge_out$counts) # extract the sample names from the new DGE list
+
+dge_samples_out <-  data.frame(Sample_ID = substr(dge_samples_out, 1, 5)) #Extract the Patient_ID's of 19 samples
+
+dge_out$samples <- dge_out$samples %>% # Discard the existing group data in DGE list
+  select(-group)
+
+dge_out$samples$Groups <- groups_out$Groups #Add the modified group data to DGE list
+
+
+## Filter out the low-quality genes
+keep1 <- rowSums(cpm(dge_out)>1) >= 11
+dge_out <- dge_out[keep1,, keep.lib.sizes = F] 
+
+length(rownames(dge_out$counts)) # 14822 genes remained after filtering
+```
+
+
+```{r}
+# Calculate mean and median library sizes (in millions)
+L1 <- mean(dge_out$samples$lib.size) * 1e-6
+M1 <- median(dge_out$samples$lib.size) * 1e-6
+logcpm_cutoff_out <- log2(10/M1 + 2/L1) # Calculate log-cpm cutoff
+
+#jpeg("Density_Plot_without_outliers_Fuentes_Study.jpeg", width = 2000, height = 1500, res = 300)
+#Density Plot 
+nsamples_out <- ncol(dge_out)
+col_out <- brewer.pal(nsamples_out, "Dark2")
+par(mfrow=c(1,2))
+plot(density(logcpm_counts_out[,1]), col=col_out[1], lwd=2, ylim=c(0,0.26), las=2, main="", xlab="") #density plot for raw data
+title(main=" Raw_data_without_outliers", xlab="Log-cpm")
+abline(v=logcpm_cutoff_out, lty=3)
+for (i in 2:nsamples_out){
+den_out <- density(logcpm_counts_out[,i])
+lines(den_out$x, den_out$y, col=col_out[i], lwd=2)
+}
+legend("topright", dge_samples_out$Sample_ID, text.col=col_out, bty="n")
+logcpm_out <- cpm(dge_out, log=TRUE, prior.count = 3)
+plot(density(logcpm_counts_out[,1]), col=col_out[1], lwd=2, ylim=c(0,0.26), las=2, main="", xlab="") #density plot for filtered data
+title(main=" Filtered_data_without_outliers", xlab="Log-cpm")
+abline(v=logcpm_cutoff_out, lty=3)
+for (i in 2:nsamples_out){
+den_out <- density(logcpm_counts_out[,i])
+lines(den_out$x, den_out$y, col=col_out[i], lwd=2)
+}
+legend("topright", dge_samples_out$Sample_ID, text.col=col_out, bty="n")
+
+#dev.off()
+```
+
+
+# Differentially expression analysis without outliers
+```{r}
+
+##--------------------------------------Time Comparison (POVsBL)-------------------------------------------------------##
+# Apply the mapping function to all sample names
+conditions_out <- sapply(colnames(dge_out$counts), map_condition, label_to_condition = label_to_condition)
+colData_out <- data.frame(condition = conditions_out, row.names = colnames(dge_out$counts))
+
+# Paired samples
+Subject_out <- factor(substr(colnames(dge_out$counts), 1, 5)) # 11 levels ; 22 pairs
+Subject_out <- factor(Subject_out, levels = unique(Subject_out))
+
+# Factor the timepoints data 
+Time_out <- factor(colData_out$condition, levels = c("BL", "PO"))
+sample_paired_data_out <- data.frame(Sample = colnames(dge_out$counts), Time = Time_out, Pair = Subject_out) #paired analysis df
+
+#create a design matrix for paired analysis 
+design_out <- model.matrix(~0+Time+Pair, data = sample_paired_data_out)
+colnames(design_out) <- gsub("Time", "", colnames(design_out))
+colnames(design_out) <- gsub("Pair", "", colnames(design_out))
+rownames(design_out) <- sample_paired_data_out$Sample
+
+## Contrast matrix for paired analysis
+contr.matrix.out <- makeContrasts(
+  Time = PO - BL,
+  levels = design_out)
+contr.matrix.out
+
+# Run voom 
+v_out <- voom(dge_out, design_out, plot = T)
+fit_out <- lmFit(v_out, design_out)
+fit_out <- contrasts.fit(fit_out, contr.matrix.out)
+efit_out <- eBayes(fit_out)
+
+#Extract a table of top-ranked genes at FDR 0.05, 0.1 & 0.2
+POVsBL_FDR_1_out <- topTable(efit_out, n = Inf, adjust.method = "fdr", sort.by = "P") # genes found for POvsBL_ALL comparison ; no FDR threshold was given to this table
+#write.csv(POVsBL_FDR_1_out, "out_limma_POVsBL_fuentes_study.csv", row.names = F)
+POVsBL_FDR_0.05_out <- topTable(efit_out, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.05) # 144 genes are found at FDR 0.05
+POVsBL_FDR_0.1_out <- topTable(efit_out, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.1) # 251 genes are found at FDR 0.1
+POVsBL_FDR_0.2_out <- topTable(efit_out, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.2) # 532 genes are found at FDR 0.2
+summary(decideTests(efit_out, adjust.method = "fdr", p.value = 0.05)) #shows upregulated and downregulated genes at FDR 0.05
+summary(decideTests(efit_out, adjust.method = "fdr", p.value = 0.1)) # shows upregulated and downregulated genes at FDR 0.1
+summary(decideTests(efit_out, adjust.method = "fdr", p.value = 0.2)) #shows upregulated and downregulated genes at FDR 0.2
+
+## Plot the distribution of p-values for the POvsBL_ALL comparison
+#jpeg("Histogram_POVsBL_Pval.jpeg", width = 2500, height = 1800, res = 300)
+hist(efit_out$p.value, main = "POVsBL (Time)")
+#dev.off()
+
+##----------------Unpaired Analysis: HIGHvsLOW_Both, HIGHvsLOW_BL, HIGHvsLOW_PO and HIGHvsLOW_Intxn comparisons--------------------##
+
+#create a combined factor for timepoints (Bl, PO) and groups (HIGH, LOW)
+Time.Grp_out <- paste(dge_out$samples$Groups, colData_out$condition, sep = "_")
+
+
+Group_out <- factor(dge_out$samples$Groups) #Convert the modified Groups data to a factor variable
+sample_unpaired_data_out <- data.frame(Sample = colnames(dge_out$counts), Time = Time_out, WTgain_sens = Group_out, Time.WTgain_sens = Time.Grp_out)
+
+# design matrix for unpaired analysis
+design1_out <- model.matrix(~0 + Time.WTgain_sens, data = sample_unpaired_data_out)
+colnames(design1_out) <- gsub("Time.WTgain_sens", "", colnames(design1_out))
+rownames(design1_out) <- sample_unpaired_data_out$Sample
+
+# Contrast matrix for unpaired analysis
+contrast.out <- makeContrasts(
+  WTgain_sens = (HIGH_BL + HIGH_PO)/2 - (LOW_BL + LOW_PO)/2,
+  BL_Difference_grps = HIGH_BL - LOW_BL,
+  PO_Difference_grps = HIGH_PO - LOW_PO,
+  Interaction =  (HIGH_BL - HIGH_PO) - (LOW_BL - LOW_PO),
+  levels = design1_out)
+contrast.out
+
+#Run voom for unpaired analysis
+v1.out <- voom(dge_out, design1_out, plot = T)
+fit1.out <- lmFit(v1.out, design1_out)
+fit1.out <- contrasts.fit(fit1.out, contrast.out)
+efit1.out <- eBayes(fit1.out)
+
+# Extract a table of top-ranked genes for HIGHvsLOW_Both, HIGHvsLOW_BL, HIGHvsLOW_PO and HIGHvsLOW_Intxn comparisons
+WTgain_sens_FDR_1_out <- topTable(efit1.out, coef= 1, n = Inf, adjust.method = "fdr", sort.by = "P") # genes found for HIGHvsLOW_Both comparison ; no FDR threshold was given to this table
+#write.csv(WTgain_sens_FDR_1_out, "out_limma_WTgain_sens_fuentes_study.csv", row.names = F)
+BL_diff_FDR_1_out <- topTable(efit1.out, coef = 2, n = Inf, adjust.method = "fdr", sort.by = "P") # genes found for HIGHvsLOW_BL comparison ; no FDR threshold was given to this table
+#write_xlsx(BL_diff_FDR_1_out, "out_limma_BLDiff_fuentes_study.xlsx")
+PO_diff_FDR_1_out <- topTable(efit1.out, coef = 3, n = Inf, adjust.method = "fdr", sort.by = "P") # genes found for HIGHvsLOW_PO comparison ; no FDR threshold was given to this table
+#write.csv(PO_diff_FDR_1_out, "out_limma_PODiff_fuentes_study.csv", row.names = F)
+Int_FDR_1_out <- topTable(efit1.out, coef = 4, n = Inf, adjust.method = "fdr", sort.by = "P" ) # genes found for HIGHvsLOW_Intxn comparison; no FDR threshold was given to this table
+#write.csv(Int_FDR_1_out, "out_limma_Interaction_fuentes_study.csv", row.names = F)
+
+
+# Extract a table of top-ranked genes at FDR 0.05 for HIGHvsLOW_Both, HIGHvsLOW_BL, HIGHvsLOW_PO and HIGHvsLOW_Intxn comparisons
+WTgain_sens_FDR_0.05_out <- topTable(efit1.out, coef = 1, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.05) # In HIGHvsLOW_Both comparison, 8 genes are found at FDR 0.05
+topTable(efit1.out, coef = 2, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.05) # no genes were found for HIGHvsLOW_BL comparison at FDR 0.05
+topTable(efit1.out, coef = 3, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.05) # no genes were found for HIGHvsLOW_PO comparison at FDR 0.05
+topTable(efit1.out, coef = 4, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.05) # No genes were found for HIGHvsLOW_Intxn comparison at FDR 0.05
+summary(decideTests(efit1.out, adjust.method = "fdr", p.value = 0.05)) # shows the upregulated and downregulated genes for all the 4 comparisons at FDR 0.05
+
+
+
+# Extract a table of top-ranked genes at FDR 0.1 for HIGHvsLOW_Both, HIGHvsLOW_BL, HIGHvsLOW_PO and HIGHvsLOW_Intxn comparisons
+WTgain_sens_FDR_0.1_out <- topTable(efit1.out, coef = 1, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.1) # In HIGHvsLOW_Both comparison, 15 genes are found at FDR 0.1
+BL_diff_FDR_0.1_out <- topTable(efit1.out, coef = 2, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.1) # In HIGHvsLOW_BL comparison, 2 genes were found at FDR 0.1
+topTable(efit1.out, coef = 3, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.1) # no genes were found for HIGHvsLOW_PO comparison at FDR 0.1
+topTable(efit1.out, coef = 4, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.1) # no genes are found for HIGHvsLOW_Intxn comparison at FDR 0.1
+summary(decideTests(efit1.out, adjust.method = "fdr", p.value = 0.1)) # shows the upregulated and downregulated genes for all the 4 comparisons at FDR 0.1
+
+#Extract a table of top-ranked genes at FDR 0.2 for HIGHvsLOW_Both, HIGHvsLOW_BL, HIGHvsLOW_PO and HIGHvsLOW_Intxn comparisons
+WTgain_sens_FDR_0.2_out <- topTable(efit1.out, coef = 1, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.2) #In HIGHvsLOW_Both comparison, 29 genes are found at FDR 0.2
+BL_diff_FDR_0.2_out <- topTable(efit1.out, coef = 2, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.2) #In HIGHvsLOW_BL comparison, 6 genes were found at FDR 0.2
+PO_diff_FDR_0.2_out <- topTable(efit1.out, coef = 3, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.2) #In HIGHvsLOW_PO comparison, no genes were found at FDR 0.2
+Int_FDR_0.2_out <- topTable(efit1.out, coef = 4, n = Inf, adjust.method = "fdr", sort.by = "P", p.value = 0.2) # In HIGHvsLOW_Intxn comparison, no genes are found at FDR 0.2
+summary(decideTests(efit1.out, adjust.method = "fdr", p.value = 0.2)) # shows the upregulated and downregulated genes for all the 4 comparisons at FDR 0.2
+
+## Plot the distribution of p-values for the HIGHvsLOW_Both comparison
+#jpeg("Hist_HighVsLow_pval_dist.jpeg", width = 2500, height = 1800, res = 300)
+hist(efit1.out$p.value[,1],main= "HighVsLow (Weight Gain Sensitivity")
+#dev.off()
+
+## Plot the distribution of p-values for the HIGHvsLOW_BL comparison
+#jpeg("Hist_BLdiff_pval_dist.jpeg", width = 2500, height = 1800, res = 300)
+hist(efit1.out$p.value[,2], main = "Baseline difference between the High and Low Groups 
+                                    (HIGH_BL - LOW_BL)")
+#dev.off()
+
+## Plot the distribution of p-values for the HIGHvsLOW_PO comparison
+#jpeg("Hist_POdiff_pval_dist.jpeg", width = 2500, height = 1800, res = 300)
+hist(efit1.out$p.value[,3], main =  "Post Observation difference between the High and Low Groups 
+                                    (HIGH_PO - LOW_PO)")
+#dev.off()
+
+## Plot the distribution of p-values for the HIGHvsLOW_Intxn comparison
+#jpeg("Hist_Int_pval_dist.jpeg", width = 2500, height = 1800, res = 300)
+hist(efit1.out$p.value[,4], main = "Interaction")
+#dev.off()
+
+
+##-----DEG's common between POvsBL_ALL and HIGHvsLOW_Both comparison & Venn Diagrams for the unpaired analysis comparisons-------
+
+# DEGs common between POvsBL_ALL and HIGHvsLOW_Both comparisons at FDR 0.05
+paired_dt_0.05_out <- data.frame(decideTests(efit_out, adjust.method = "fdr", p.value = 0.05))
+unpaired_dt_0.05_out <- data.frame(decideTests(efit1.out, adjust.method = "fdr", p.value = 0.05))
+dt_0.05_out <- data.frame(Time = paired_dt_0.05_out$Time, HIGHvsLOW_Both = unpaired_dt_0.05_out$WTgain_sens, HIGHvsLOW_BL = unpaired_dt_0.05_out$BL_Difference_grps, HIGHvsLOW_PO = unpaired_dt_0.05_out$PO_Difference_grps, HIGHvsLOW_Intxn = unpaired_dt_0.05_out$Interaction)
+de.common_0.05_out <- which(dt_0.05_out[,1]!=0 & dt_0.05_out[,2]!=0)
+head(efit_out$genes$gene[de.common_0.05_out]) # only 2 genes were found common between POvsBL_ALL and HIGHvsLOW_Both comparisons
+head(efit1.out$genes$gene[de.common_0.05_out]) 
+
+## VennDiagram for unpaired analysis DEGs at FDR 0.05
+#jpeg("VennDiagram_FDR_0.05_without_outliers.jpeg", width = 2500, height = 1800, res = 400)
+vennDiagram(dt_0.05_out[,2:5], circle.col=c("turquoise", "salmon", "violet", "darkgreen"), cex = 0.9)
+title(main = "Unpaired analysis DEGs at FDR 0.05 without outliers", font = 2)
+#dev.off()
+
+# DEGs common between POvsBL_ALL and HIGHvsLOW_Both comparisons at FDR 0.1
+paired_dt_0.1_out <- data.frame(decideTests(efit_out, adjust.method = "fdr", p.value = 0.1))
+unpaired_dt_0.1_out <- data.frame(decideTests(efit1.out, adjust.method = "fdr", p.value = 0.1))
+dt_0.1_out <- data.frame(Time = paired_dt_0.1_out$Time, HIGHvsLOW_Both = unpaired_dt_0.1_out$WTgain_sens, HIGHvsLOW_BL = unpaired_dt_0.1_out$BL_Difference_grps, HIGHvsLOW_PO = unpaired_dt_0.1_out$PO_Difference_grps, HIGHvsLOW_Intxn = unpaired_dt_0.1_out$Interaction)
+de.common_0.1_out <- which(dt_0.1_out[,1]!= 0 & dt_0.1_out[,2]!=0)
+head(efit1.out$genes$gene[which(dt_0.1_out[,2]!=0 & dt_0.1_out[,3]!=0)]) #2 genes were found common between HIGHvsLOW_Both and HIGHvsLOW_BL at FDR 0.1
+head(efit_out$genes$gene[de.common_0.1_out]) # 4 genes were found common between POvsBL_ALL and HIGHvsLOW_Both comparisons
+head(efit1.out$genes$gene[de.common_0.1_out])
+
+## vennDiagram for unpaired analysis DEGs at FDR 0.1
+#jpeg("VennDiagram_FDR_0.1_without_outliers.jpeg", width = 2500, height = 1800, res = 400)
+vennDiagram(dt_0.1_out[,2:5], circle.col=c("turquoise", "salmon", "violet", "darkgreen"), cex = 0.9)
+title(main = "Unpaired analysis DEGs at FDR 0.1 without outliers", font = 2)
+#dev.off()
+
+# DEGs common between POvsBL_ALL and HIGHvsLOW_Both comparisons at FDR 0.2
+paired_dt_0.2_out <- data.frame(decideTests(efit_out, adjust.method = "fdr", p.value = 0.2))
+unpaired_dt_0.2_out <- data.frame(decideTests(efit1.out, adjust.method = "fdr", p.value = 0.2))
+dt_0.2_out <- data.frame(Time = paired_dt_0.2_out$Time, HIGHvsLOW_Both = unpaired_dt_0.2_out$WTgain_sens, HIGHvsLOW_BL = unpaired_dt_0.2_out$BL_Difference_grps, HIGHvsLOW_PO = unpaired_dt_0.2_out$PO_Difference_grps, HIGHvsLOW_Intxn = unpaired_dt_0.2_out$Interaction)
+de.common_0.2_out <- which(dt_0.2_out[,1]!= 0 & dt_0.2_out[,2]!=0)
+efit1.out$genes$gene[which(dt_0.2_out[,2]!=0 & dt_0.2_out[,3]!=0)] # 3 genes were found common between HIGHvsLOW_Both and HIGHvsLOW_BL at FDR 0.2
+head(efit_out$genes$gene[de.common_0.2_out]) # 9 genes were found common between POvsBL_ALL and HIGHvsLOW_Both comparisons
+head(efit1.out$genes$gene[de.common_0.2_out])
+
+## vennDiagram for unpaired analysis DEGs at FDR 0.2
+#jpeg("VennDiagram_FDR_0.2_without_outliers.jpeg", width = 2500, height = 1800, res = 400)
+vennDiagram(dt_0.2_out[,2:5], circle.col=c("turquoise", "salmon", "violet", "darkgreen"), cex = 0.9)
+title(main = "Unpaired analysis DEGs at FDR 0.2 without outliers", font = 2)
+#dev.off()
+```
+
+
+#volcano plot
+```{r}
+#jpeg("volcano_POvsBl_Fuentes_Study.jpeg", width = 2000, height = 1500, res = 300)
+## volcano plot for Time comparison (PO vs BL) - paired analysis
+ggplot(POVsBL_FDR_1_out, aes(x= logFC ,
+                     y=-log10(adj.P.Val), 
+                     color= -log10(adj.P.Val)))+
+  geom_point(size=2)+
+  geom_point(data=subset(POVsBL_FDR_1_out %>% slice_min(adj.P.Val, n=20)),
+             aes(x= logFC, 
+                 y=-log10(adj.P.Val), 
+                 color= -log10(adj.P.Val)))+
+  #scale_color_manual(values = c("blue", "grey50", "darkred"))+
+  scale_color_viridis(option="rocket", direction=1)+
+  geom_text_repel(data=subset(POVsBL_FDR_1_out %>% slice_min(adj.P.Val, n=20)),
+                     aes(x=logFC, 
+                    y=-log10(adj.P.Val), 
+                     color= -log10(adj.P.Val),label = gene), 
+                  color = "black", size=4, box.padding = unit(0.2, "lines"),segment.color="gray25",
+                  segment.size=0.25, point.padding = unit(0.2, "lines"), max.overlaps = Inf)+
+  geom_hline(yintercept=-log10(0.05), linetype="dashed") +
+  geom_vline(xintercept=c(1,-1),linetype="dashed")+
+  theme(panel.background = element_rect(fill = "white", colour = "black")) +
+  theme(axis.text = element_text (size = 10, face ="bold", colour = "black"))+
+  theme(axis.title = element_text (size = 18, face = "bold", colour = "black")) +
+  theme(strip.text = element_text(size=10, face="bold", color = "black"))+
+  ggtitle("volcano_Plot_Top20genes_POVsBL")+
+  theme(plot.title=element_text(face="bold"))+
+  xlab("log2FC (PO vs. BL)") +
+  ylab("-log10 FDR (PO vs. BL)")+
+  theme(legend.position="bottom") #to maximize graph space by removing legends
+
+#dev.off()
+
+
+#jpeg("volcano_HIGHvsLOW_Both_Fuentes_Study.jpeg", width = 2000, height = 1500, res = 300)
+## volcano plot for HIGHvsLOW_Both comparison - unpaired analysis
+ggplot(WTgain_sens_FDR_1_out, aes(x= logFC ,
+                     y=-log10(adj.P.Val), 
+                     color= -log10(adj.P.Val)))+
+  geom_point(size=2)+
+  geom_point(data=subset(WTgain_sens_FDR_1_out %>% slice_min(adj.P.Val, n=20)),
+             aes(x= logFC, 
+                 y=-log10(adj.P.Val), 
+                 color= -log10(adj.P.Val)))+
+  scale_color_viridis(option="rocket", direction=1)+
+  geom_text_repel(data=subset(WTgain_sens_FDR_1_out %>% slice_min(adj.P.Val, n=20)),
+                     aes(x=logFC, 
+                    y=-log10(adj.P.Val), 
+                     color= -log10(adj.P.Val),label = gene), 
+                  color = "black", size=4, box.padding = unit(0.2, "lines"),segment.color="gray25",
+                  segment.size=0.25, point.padding = unit(0.2, "lines"), max.overlaps = Inf)+
+  geom_hline(yintercept=-log10(0.05), linetype="dashed") +
+  geom_vline(xintercept=c(1,-1),linetype="dashed")+
+  theme(panel.background = element_rect(fill = "white", colour = "black")) +
+  theme(axis.text = element_text (size = 10, face ="bold", colour = "black"))+
+  theme(axis.title = element_text (size = 18, face = "bold", colour = "black")) +
+  theme(strip.text = element_text(size=10, face="bold", color = "black"))+
+  ggtitle("Volcano_Plot_Top20genes_WeightGain_sensitivity")+
+  theme(plot.title=element_text(face="bold"))+
+  xlab("log2FC (High vs Low )") +
+  ylab("-log10 FDR (High vs. Low)")+
+  theme(legend.position="bottom") #to maximize graph space by removing legends
+
+#dev.off()
+```
+
+# volcano plot for HIGHvsLOW_BL, HIGHvsLOW_PO, HIGHvsLOW_Intxn comparisons - unpaired analysis
+```{r}
+library(gridExtra)
+
+#jpeg("volcano_HIGHVsLOW_BL_Fuentes_Study.jpeg", width = 2000, height = 1500, res = 300)
+## volcano plot for HIGH Vs LOW at BL 
+volcano_HIGHVsLOW_BL <- ggplot(BL_diff_FDR_1_out, aes(x= logFC ,
+                     y=-log10(P.Value), 
+                     color= -log10(P.Value)))+
+  geom_point(size=2)+
+  geom_point(data=subset(BL_diff_FDR_1_out %>% slice_min(P.Value, n=20)),
+             aes(x= logFC, 
+                 y=-log10(P.Value), 
+                 color= -log10(P.Value)))+
+  scale_color_viridis(option="rocket", direction=1)+
+  geom_text_repel(data=subset(BL_diff_FDR_1_out %>% slice_min(P.Value, n=20)),
+                     aes(x=logFC, 
+                    y=-log10(P.Value), 
+                     color= -log10(P.Value),label = gene), 
+                  color = "black", size=4, box.padding = unit(0.2, "lines"),segment.color="gray25",
+                  segment.size=0.25, point.padding = unit(0.2, "lines"), max.overlaps = Inf)+
+  geom_hline(yintercept=-log10(0.05), linetype="dashed") +
+  geom_vline(xintercept=c(1,-1),linetype="dashed")+
+  theme(panel.background = element_rect(fill = "white", colour = "black")) +
+  theme(axis.text = element_text (size = 11, face ="bold", colour = "black"))+
+  theme(axis.title = element_text (size = 11, face = "bold", colour = "black")) +
+  theme(strip.text = element_text(size=11, face="bold", color = "black"))+
+  ggtitle("Volcano_Plot_Top20genes_HIGHVsLOW_BL")+
+  theme(plot.title=element_text(face="bold"))+
+  xlab("log2FC (HIGH_BL vs LOW_BL )") +
+  ylab("-log10 P.value (HIGH_BL vs. LOW_BL)")+
+  theme(legend.position="bottom") #to maximize graph space by removing legends
+
+#dev.off()
+
+#jpeg("volcano_HIGHVsLOW_PO_Fuentes_Study.jpeg", width = 2000, height = 1500, res = 300)
+## volcano plot for HIGH Vs LOW at PO 
+volcano_HIGHVsLOW_PO <- ggplot(PO_diff_FDR_1_out, aes(x= logFC ,
+                     y=-log10(P.Value), 
+                     color= -log10(P.Value)))+
+  geom_point(size=2)+
+  geom_point(data=subset(PO_diff_FDR_1_out %>% slice_min(P.Value, n=20)),
+             aes(x= logFC, 
+                 y=-log10(P.Value), 
+                 color= -log10(P.Value)))+
+  scale_color_viridis(option="rocket", direction=1)+
+  geom_text_repel(data=subset(PO_diff_FDR_1_out %>% slice_min(P.Value, n=20)),
+                     aes(x=logFC, 
+                    y=-log10(P.Value), 
+                     color= -log10(P.Value),label = gene), 
+                  color = "black", size=4, box.padding = unit(0.2, "lines"),segment.color="gray25",
+                  segment.size=0.25, point.padding = unit(0.2, "lines"), max.overlaps = Inf)+
+  geom_hline(yintercept=-log10(0.05), linetype="dashed") +
+  geom_vline(xintercept=c(1,-1),linetype="dashed")+
+  theme(panel.background = element_rect(fill = "white", colour = "black")) +
+  theme(axis.text = element_text (size = 11, face ="bold", colour = "black"))+
+  theme(axis.title = element_text (size = 11, face = "bold", colour = "black")) +
+  theme(strip.text = element_text(size=11, face="bold", color = "black"))+
+  ggtitle("Volcano_Plot_Top20genes_HIGHVsLOW_PO")+
+  theme(plot.title=element_text(face="bold"))+
+  xlab("log2FC (HIGH_PO vs LOW_PO )") +
+  ylab("-log10 P.Value (HIGH_PO vs. LOW_PO)")+
+  theme(legend.position="bottom") #to maximize graph space by removing legends
+
+#dev.off()
+
+#jpeg("volcano_HIGHVsLOW_Intxn_Fuentes_Study.jpeg", width = 2000, height = 1500, res = 300)
+## volcano plot for Interaction 
+volcano_HIGHVsLOW_Intxn <- ggplot(Int_FDR_1_out, aes(x= logFC ,
+                     y=-log10(P.Value), 
+                     color= -log10(P.Value)))+
+  geom_point(size=2)+
+  geom_point(data=subset(Int_FDR_1_out %>% slice_min(P.Value, n=20)),
+             aes(x= logFC, 
+                 y=-log10(P.Value), 
+                 color= -log10(P.Value)))+
+  scale_color_viridis(option="rocket", direction=1)+
+  geom_text_repel(data=subset(Int_FDR_1_out %>% slice_min(P.Value, n=20)),
+                     aes(x=logFC, 
+                    y=-log10(P.Value), 
+                     color= -log10(P.Value),label = gene), 
+                  color = "black", size=4, box.padding = unit(0.2, "lines"),segment.color="gray25",
+                  segment.size=0.25, point.padding = unit(0.2, "lines"), max.overlaps = Inf)+
+  geom_hline(yintercept=-log10(0.05), linetype="dashed") +
+  geom_vline(xintercept=c(1,-1),linetype="dashed")+
+  theme(panel.background = element_rect(fill = "white", colour = "black")) +
+  theme(axis.text = element_text (size = 11, face ="bold", colour = "black"))+
+  theme(axis.title = element_text (size = 11, face = "bold", colour = "black")) +
+  theme(strip.text = element_text(size=11, face="bold", color = "black"))+
+  ggtitle("Volcano_Plot_Top20genes_HIGHVsLOW_Intxn")+
+  theme(plot.title=element_text(face="bold"))+
+  xlab("log2FC(Interaction: PO vs BL by HIGH vs LOW)") +
+  ylab("-log10 P.Value (Interaction Effect)")+
+  theme(legend.position="bottom") #to maximize graph space by removing legends
+
+#dev.off()
+
+combined_plot <- grid.arrange(volcano_HIGHVsLOW_BL, volcano_HIGHVsLOW_PO, volcano_HIGHVsLOW_Intxn, ncol = 3)
+ggsave("combined_volcano_plots.png", plot = combined_plot, width = 18, height = 6, dpi = 300)
+
+
+```
+
+
+# Heatmap of top significant genes
+```{r}
+# Heatmap of top significant genes at FDR 0.05 for POvsBL_ALL comparison - paired analysis
+topgenes.time.filtered <- POVsBL_FDR_0.05_out[POVsBL_FDR_0.05_out$adj.P.Val < 0.05 & abs(POVsBL_FDR_0.05_out$logFC) > 1, ] # Filter genes with adjusted p-value < 0.05 and absolute log fold change > 1
+i.1 <- efit_out$genes$gene[which(efit_out$genes$gene %in% topgenes.time.filtered$gene)] # Identify genes that overlap between efit_out and the filtered gene list
+
+# Subset the logCPM data for the identified genes and remove the gene column
+data_hist_time <- logcpm_out[logcpm_out$Gene %in% i.1, -1]
+rownames(data_hist_time) <- i.1 #add the identified genes as rownames
+colnames(data_hist_time)
+
+bl_samples <- grep("BL", colnames(data_hist_time), value = TRUE)  # Extract BL sample names
+po_samples <- grep("PO", colnames(data_hist_time), value = TRUE)  # Extract PO sample names
+
+# Reorder the columns such that BL and PO samples are grouped
+ordered_samples <- c(bl_samples, po_samples)
+
+#Reorder the data_hist_time columns according to the ordered_samples
+data_hist_time <- data_hist_time[, ordered_samples]
+
+#color palette
+my_palette <- colorRampPalette(c("blue", "white", "red"))(100)
+
+# create an annotation dataframe for the samples
+annot_col_time <- data.frame(Time = substr(colnames(data_hist_time),6,7))
+rownames(annot_col_time) <- colnames(data_hist_time)
+
+annot_colors_time <- list(
+  Time = c(BL = "#1B9E77", PO = "#D95F02")
+)
+
+#jpeg("Heatmap_POvsBL_Fuentes_Study.jpeg", width = 3000, height = 1800, res = 400)
+
+#generate heatmap
+pheatmap(data_hist_time, show_rownames = T, scale = "row", cluster_cols= F, cluster_rows = T, cex = 1, color = my_palette, fontsize_row =7 , fontsize_col = 10, border_color = NA, annotation_col = annot_col_time, annotation_colors = annot_colors_time, annotation_legend = T, main = "Topgenes_POVsBL_FDR_0.05")
+
+#dev.off()
+
+## Heatmap of top significant genes at FDR 0.2 for HIGHvsLOW_Both comparison - unpaired analysis
+topgenes.WTgain_sens.filtered <- WTgain_sens_FDR_0.2_out[WTgain_sens_FDR_0.2_out$adj.P.Val < 0.2 & abs(WTgain_sens_FDR_0.2_out$logFC) > 1, ]  # Filter genes with adjusted p-value < 0.2 and absolute log fold change > 1
+i.2 <- efit1.out$genes$gene[which(efit1.out$genes$gene %in% topgenes.WTgain_sens.filtered$gene)] # Identify genes that overlap between efit_out and the filtered gene list
+
+# Subset the logCPM data for the identified genes and remove the gene column
+data_hist_WTgain_sens <- logcpm_out[logcpm_out$Gene %in% i.2, -1]
+rownames(data_hist_WTgain_sens) <- i.2
+colnames(data_hist_WTgain_sens)
+
+#Reorder the data_hist_WTgain_sens columns according to the ordered_samples
+data_hist_WTgain_sens <- data_hist_WTgain_sens[, ordered_samples]
+
+# create an annotation dataframe for the samples
+annot_col <- data.frame(WTgain_sens = dge_out$samples$Groups)
+annot_col$WTgain_sens <- annot_col$WTgain_sens[match(ordered_samples, rownames(dge_out$samples))]
+rownames(annot_col) <- colnames(data_hist_WTgain_sens)
+
+ann_colors <- list(
+  WTgain_sens = c(HIGH = "#1B9E77", LOW = "#D95F02")
+)
+
+#jpeg("Heatmap_WTgain_sens_Fuentes_Study.jpeg", width = 3000, height = 1800, res = 400)
+
+#generate heatmap
+pheatmap(data_hist_WTgain_sens, show_rownames = T, scale = "row", cluster_cols= F, cluster_rows = T, cex = 0.95, color = my_palette, fontsize_row = 8 , fontsize_col = 10, border_color = NA, annotation_col = annot_col, annotation_colors = ann_colors, annotation_legend = T, main = "Topgenes_HighVsLow_FDR_0.2")
+
+#dev.off()
+```
+
+##  Heatmaps for HIGHvsLOW_BL, HIGHvsLOW_PO, HIGHvsLOW_Intxn comparisons - unpaired analysis
+```{r}
+## Heatmap of top significant genes at P.val < 0.01 for HIGH Vs LOW at BL comparison
+topgenes.HIGHVsLOW_BL.filtered <- BL_diff_FDR_1_out[BL_diff_FDR_1_out$P.Value < 0.01 & abs(BL_diff_FDR_1_out$logFC) > 1, ] # Filter genes with p-value < 0.01 and absolute log fold change > 1
+i.3 <- efit1.out$genes$gene[which(efit1.out$genes$gene %in% topgenes.HIGHVsLOW_BL.filtered$gene)] # Identify genes that overlap between efit1.out and the filtered gene list
+
+# Subset the logCPM data for the identified genes and remove the gene column
+data_hist_HIGHVsLOW_BL <- logcpm_out[logcpm_out$Gene %in% i.3, -1]
+rownames(data_hist_HIGHVsLOW_BL) <- i.3
+
+data_hist_HIGHVsLOW_BL <- data_hist_HIGHVsLOW_BL %>% select(-contains("PO"))
+colnames(data_hist_HIGHVsLOW_BL)
+
+
+# create an annotation dataframe for the samples
+annot_col_bl <- data.frame(HIGHVsLOW_BL = dge_out$samples$Groups, row.names = rownames(dge_out$samples))
+annot_col_bl <-  annot_col_bl[!grepl("PO", rownames(annot_col_bl)), ]
+annot_col_bl <- data.frame(HIGHVsLOW_BL = annot_col_bl)
+rownames(annot_col_bl) <- colnames(data_hist_HIGHVsLOW_BL)
+all(rownames(annot_col_bl$HIGHVsLOW_BL) == colnames(data_hist_HIGHVsLOW_BL)) 
+
+ann_colors_bl <- list(
+  WTgain_sens = c(HIGH = "#1B9E77", LOW = "#D95F02")
+)
+my_palette <- colorRampPalette(c("blue", "white", "red"))(100)
+
+#png("Heatmap_HIGHVsLOW_BL_Fuenetes_Study.png", width = 800, height = 1000, res = 100) 
+
+# Plot with adjusted row name options
+pheatmap(data_hist_HIGHVsLOW_BL, 
+         show_rownames = TRUE, 
+         scale = "row", 
+         cluster_cols = FALSE, 
+         cluster_rows = TRUE, 
+         fontsize_row = 6,         # Smaller font size for row names
+         fontsize_col = 8,         # Smaller font size for column names (adjust as needed)
+         color = my_palette,  
+         border_color = NA, 
+         annotation_col = annot_col_bl, 
+         annotation_colors = ann_colors_bl, 
+         annotation_legend = TRUE, 
+         main = "Topgenes_HighVsLow_BL (P.Val< 0.01)")
+
+
+#dev.off()
+
+## Heatmap of top significant genes at P.val < 0.01 for HIGH Vs LOW at PO comparison
+topgenes.HIGHVsLOW_PO.filtered <- PO_diff_FDR_1_out[PO_diff_FDR_1_out$P.Value < 0.01 & abs(PO_diff_FDR_1_out$logFC) > 1, ] # Filter genes with p-value < 0.01 and absolute log fold change > 1
+i.4 <- efit1.out$genes$gene[which(efit1.out$genes$gene %in% topgenes.HIGHVsLOW_PO.filtered$gene)] # Identify genes that overlap between efit1.out and the filtered gene list
+
+# Subset the logCPM data for the identified genes and remove the gene column
+data_hist_HIGHVsLOW_PO <- logcpm_out[logcpm_out$Gene %in% i.4, -1]
+rownames(data_hist_HIGHVsLOW_PO) <- i.4
+
+data_hist_HIGHVsLOW_PO <- data_hist_HIGHVsLOW_PO %>% select(-contains("BL"))
+colnames(data_hist_HIGHVsLOW_PO)
+
+
+# create an annotation dataframe for the samples
+annot_col_po <- data.frame(HIGHVsLOW_PO = dge_out$samples$Groups, row.names = rownames(dge_out$samples))
+annot_col_po <-  annot_col_po[!grepl("BL", rownames(annot_col_po)), ]
+annot_col_po <- data.frame(HIGHVsLOW_PO = annot_col_po)
+rownames(annot_col_po) <- colnames(data_hist_HIGHVsLOW_PO)
+all(rownames(annot_col_po) == colnames(data_hist_HIGHVsLOW_PO)) 
+
+ann_colors_po <- list(
+  WTgain_sens = c(HIGH = "#1B9E77", LOW = "#D95F02")
+)
+my_palette <- colorRampPalette(c("blue", "white", "red"))(100)
+
+#jpeg("Heatmap_HIGHVsLOW_PO_Fuenetes_Study.png", width = 2500, height = 1800, res = 300) 
+
+# Plot with adjusted row name options
+pheatmap(data_hist_HIGHVsLOW_PO, 
+         show_rownames = TRUE, 
+         scale = "row", 
+         cluster_cols = FALSE, 
+         cluster_rows = TRUE, 
+         fontsize_row = 6,         # Smaller font size for row names
+         fontsize_col = 8,         # Smaller font size for column names (adjust as needed)
+         color = my_palette,  
+         border_color = NA, 
+         annotation_col = annot_col_po, 
+         annotation_colors = ann_colors_po, 
+         annotation_legend = TRUE, 
+         main = "Topgenes_HighVsLow_PO (P.Val< 0.01)")
+
+
+#dev.off()
+
+## Heatmap of top significant genes at P.val < 0.01 at Interaction comparison
+topgenes.HIGHVsLOW_Intxn.filtered <- Int_FDR_1_out[Int_FDR_1_out$P.Value < 0.01 & abs(Int_FDR_1_out$logFC) > 1, ] # Filter genes with p-value < 0.01 and absolute log fold change > 1
+i.5 <- efit1.out$genes$gene[which(efit1.out$genes$gene %in% topgenes.HIGHVsLOW_Intxn.filtered$gene)] # Identify genes that overlap between efit1.out and the filtered gene list
+
+# Subset the logCPM data for the identified genes and remove the gene column
+data_hist_HIGHVsLOW_Intxn <- logcpm_out[logcpm_out$Gene %in% i.5, -1 ]
+rownames(data_hist_HIGHVsLOW_Intxn) <- i.5
+colnames(data_hist_HIGHVsLOW_Intxn)
+
+bl <- grep("BL", colnames(data_hist_HIGHVsLOW_Intxn), value = TRUE)  # Extract BL sample names
+po <- grep("PO", colnames(data_hist_HIGHVsLOW_Intxn), value = TRUE)  # Extract PO sample names
+
+# Reorder the columns such that BL and PO samples are grouped
+order <- c(bl, po)
+
+data_hist_HIGHVsLOW_Intxn <- data_hist_HIGHVsLOW_Intxn[, order]
+
+
+# create an annotation dataframe for the samples
+annot_col_int <- data.frame(WTgain_sens = dge_out$samples$Groups)
+annot_col_int$WTgain_sens <- annot_col_int$WTgain_sens[match(order, rownames(dge_out$samples))]
+annot_col_int$Time <- substr(rownames(annot_col_int), 6, 7)
+rownames(annot_col_int) <- colnames(data_hist_HIGHVsLOW_Intxn) 
+
+ann_colors_int <- list(
+  WTgain_sens = c(HIGH = "#1B9E77", LOW = "#D95F02"),
+  Time = c(BL = "darkblue", PO = "darkred")
+  
+)
+my_palette <- colorRampPalette(c("blue", "white", "red"))(100)
+
+#jpeg("Heatmap_Interaction_Fuenetes_Study.png", width = 2500, height = 1800, res = 300) 
+
+# Plot with adjusted row name options
+pheatmap(data_hist_HIGHVsLOW_Intxn, 
+         show_rownames = TRUE, 
+         scale = "row", 
+         cluster_cols = FALSE, 
+         cluster_rows = TRUE, 
+         fontsize_row = 6,        
+         fontsize_col = 8,         
+         color = my_palette,  
+         border_color = NA, 
+         annotation_col = annot_col_int, 
+         annotation_colors = ann_colors_int, 
+         annotation_legend = TRUE, 
+         main = "Topgenes_Interaction (P.Val< 0.01)")
+
+
+#dev.off()
+```
+
+
+# Perform Fast Gene Set Enrichment Analysis (FGSEA) using the Hallmark database
+```{r}
+# Load the hallmark db
+hallmark <- gmtPathways("h.all.v2024.1.Hs.symbols.gmt")
+
+# View the pathways
+str(head(hallmark))
+
+# prepare ranked gene list for po vs bl
+ranked_genes <- POVsBL_FDR_1_out$logFC
+names(ranked_genes) <- POVsBL_FDR_1_out$gene
+
+# Sort genes in decreasing order of logFC
+ranked_genes <- sort(ranked_genes, decreasing = TRUE)
+
+# View the ranked genes
+head(ranked_genes)
+
+# Run fgsea with Hallmark pathways 
+FGSEA_hl_time <- fgsea(pathways = hallmark , # List of gene sets to check
+                 stats = ranked_genes,
+                  eps = 0,
+                 scoreType = 'std', 
+                 minSize = 15,
+                 maxSize = 250)
+
+#FGSEA_hl_time$leadingEdge <- sapply(FGSEA_hl_time$leadingEdge, function(x) paste(x, collapse=",")) #converting each element of Leading Edge into character string
+#write_xlsx(FGSEA_hl_time, "Fgsea_HallmarkPathway_POVsBL.xlsx")
+
+# Top 6 enriched pathways (ordered by p-val)
+head(FGSEA_hl_time[order(pval), ])
+
+sum(FGSEA_hl_time[, padj < 0.05]) #8 significant pathways 
+
+sum(FGSEA_hl_time[, pval < 0.05]) #10 significant pathways
+
+#select top pathways and create a table
+topPathwaysUp_hl_time <- FGSEA_hl_time[ES > 0 & padj < 0.05][head(order(padj), n = 5), pathway] # Extract the top 5 hallmark pathways upregulated at fdr 0.05
+topPathwaysDown_hl_time <- FGSEA_hl_time[ES < 0 & padj <0.05][head(order(padj), n =5), pathway] # Extract the top 5 hallmark pathways downregulated at fdr 0.05
+topPathways_hl_time <- c(topPathwaysUp_hl_time, rev(topPathwaysDown_hl_time))
+plotGseaTable(hallmark[topPathways_hl_time], stats = ranked_genes, fgseaRes = FGSEA_hl_time, gseaParam = 0.5)
+
+# remove redundant pathways
+collapsedPathways_hl_time <- collapsePathways(FGSEA_hl_time[order(pval)][padj < 0.01], hallmark, ranked_genes, gseaParam = 1)
+
+# plot the most significantly enriched pathway
+plotEnrichment(hallmark[[head(FGSEA_hl_time[order(padj), ], 1)$pathway]],
+               ranked_genes) + 
+  labs(title = head(FGSEA_hl_time[order(padj), ], 1)$pathway)
+
+# using gggsea to generate enrichment plots for top pathways (identified from fgsea above)
+
+# call selected pathways file
+setlist_hl_time = hallmark[topPathways_hl_time]
+
+# generate data for input into pathway images
+df_hl_time = gseaCurve(ranked_genes, setlist_hl_time, FGSEA_hl_time)
+
+#jpeg("HallmarkPathway_POvsBL_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+
+
+ggplot2::ggplot() +
+  geom_gsea(df_hl_time, linecolor = "darkgreen", zeroline = F, linesize = 1, labelsize = 2) +
+  theme_gsea(7) +
+  labs(title = "HallmarkPathway_POVsBL(FDR<=0.05)") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+
+
+#dev.off()
+```
+
+
+# Perform Fast Gene Set Enrichment Analysis (FGSEA) using the Wiki database
+```{r}
+# Load the wiki db
+Wiki <- gmtPathways("c2.cp.wikipathways.v2024.1.Hs.symbols.gmt")
+
+# View the pathways
+str(head(Wiki))
+
+# Run fgsea with the wiki pathways 
+FGSEA_Wk_time <- fgsea(pathways = Wiki , # List of gene sets to check
+                 stats = ranked_genes,
+                  eps = 0,
+                 scoreType = 'std', 
+                 minSize = 15,
+                 maxSize = 250)
+
+#FGSEA_Wk_time$leadingEdge <- sapply(FGSEA_Wk_time$leadingEdge, function(x) paste(x, collapse=",")) #converting each element of Leading Edge into character string
+#write_xlsx(FGSEA_Wk_time, "Fgsea_WikiPathway_POVsBL.xlsx")
+
+# Top 6 enriched pathways (ordered by p-val)
+head(FGSEA_Wk_time[order(pval), ])
+
+sum(FGSEA_Wk_time[, padj < 0.05]) #10 significant pathways 
+
+sum(FGSEA_Wk_time[, pval < 0.05]) # 46 significant pathways
+
+#select top pathways and create a table
+topPathwaysUp_Wk_time <- FGSEA_Wk_time[ES > 0 & padj < 0.05][head(order(padj), n =5), pathway] #Extract the top 5 wiki pathways upregulated at fdr 0.05
+topPathwaysDown_Wk_time <- FGSEA_Wk_time[ES < 0 & padj < 0.05][head(order(padj), n = 5), pathway] #Extract the top 5 wiki pathways downregulated at fdr 0.05
+topPathways_Wk_time <- c(topPathwaysUp_Wk_time, rev(topPathwaysDown_Wk_time))
+plotGseaTable(Wiki[topPathways_Wk_time], stats = ranked_genes, fgseaRes = FGSEA_Wk_time, colwidths = c(5,3,0.8,1,1), gseaParam = 0.5)
+
+# remove redundant pathways
+collapsedPathways_Wk_time <- collapsePathways(FGSEA_Wk_time[order(pval)][padj < 0.01], Wiki, ranked_genes, gseaParam = 1)
+mainPathways_Wk_time <- FGSEA_Wk_time[pathway %in% collapsedPathways_Wk_time$mainPathways][order(-NES), pathway]
+plotGseaTable(Wiki[mainPathways_Wk_time], ranked_genes, FGSEA_Wk_time, gseaParam = 0.5)
+
+
+# plot the most significantly enriched pathway
+plotEnrichment(Wiki[[head(FGSEA_Wk_time[order(padj), ], 1)$pathway]],
+               ranked_genes ) + 
+  labs(title = head(FGSEA_Wk_time[order(padj), ], 1)$pathway) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"))
+
+# using gggsea to generate enrichment plots for top pathways (identified from fgsea above)
+
+# call selected pathways file
+setlist_Wk_time = Wiki[topPathways_Wk_time]
+
+# generate data for input into pathway images
+df_Wk_time = gseaCurve(ranked_genes, setlist_Wk_time, FGSEA_Wk_time)
+
+#jpeg("WikiPathway_POVsBL_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot2::ggplot() +
+  geom_gsea(df_Wk_time, linecolor = "darkgreen", zeroline = F, linesize = 1, labelsize = 2) +
+  theme_gsea(7) +
+  labs(title = "WikiPathway_POVsBL(FDR<=0.05)") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+
+#dev.off()
+```
+
+
+
+# Perform Fast Gene Set Enrichment Analysis (FGSEA) using the KEGG database
+```{r}
+# Load the Kegg database
+kegg <- gmtPathways("c2.cp.kegg_legacy.v2024.1.Hs.symbols.gmt")
+
+# View the pathways
+str(head(kegg))
+
+# Run fgsea with the kegg pathways 
+FGSEA_Kg_time <- fgsea(pathways = kegg , # List of gene sets to check
+                 stats = ranked_genes,
+                  eps = 0,
+                 scoreType = 'std', 
+                 minSize = 15,
+                 maxSize = 250)
+
+#FGSEA_Kg_time$leadingEdge <- sapply(FGSEA_Kg_time$leadingEdge, function(x) paste(x, collapse=",")) #converting each element of Leading Edge into character string
+#write_xlsx(FGSEA_Kg_time, "Fgsea_KEGGPathway_POVsBL.xlsx")
+
+# Top 6 enriched pathways (ordered by p-val)
+head(FGSEA_Kg_time[order(pval), ])
+
+sum(FGSEA_Kg_time[, padj < 0.05]) #6 significant pathways
+
+sum(FGSEA_Kg_time[, pval < 0.05]) #20 significant pathways
+
+#select top pathways and create a table
+topPathwaysUp_Kg_time <- FGSEA_Kg_time[ES > 0 & padj < 0.05][head(order(padj), n = 5), pathway] # top kegg pathways upregulated at fdr 0.05
+topPathwaysDown_Kg_time <- FGSEA_Kg_time[ES < 0 & padj < 0.05][head(order(padj), n = 5), pathway] # top kegg pathways downregulated at fdr 0.05
+topPathways_Kg_time <- c(topPathwaysUp_Kg_time, rev(topPathwaysDown_Kg_time))
+plotGseaTable(kegg[topPathways_Kg_time], stats = ranked_genes, fgseaRes = FGSEA_Kg_time, colwidths = c(5,3,0.8,1,1), gseaParam = 0.5)
+
+# remove redundant pathways
+collapsedPathways_kg_time <- collapsePathways(FGSEA_Kg_time[order(pval)][padj < 0.01], kegg, ranked_genes, gseaParam = 1)
+mainPathways_kg_time <- FGSEA_Kg_time[pathway %in% collapsedPathways_kg_time$mainPathways][order(-NES), pathway]
+plotGseaTable(kegg[mainPathways_kg_time], ranked_genes, FGSEA_Kg_time, gseaParam = 0.5)
+
+
+# plot the most significantly enriched pathway
+plotEnrichment(kegg[[head(FGSEA_Kg_time[order(padj), ], 1)$pathway]],
+               ranked_genes ) + 
+  labs(title = head(FGSEA_Kg_time[order(padj), ], 1)$pathway) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"))
+
+# using gggsea to generate enrichment plots for top pathways (identified from fgsea above)
+
+# call selected pathways file
+setlist_Kg_time = kegg[topPathways_Kg_time]
+
+# generate data for input into pathway images
+df_Kg_time = gseaCurve(ranked_genes, setlist_Kg_time, FGSEA_Kg_time)
+
+#jpeg("KEGGPathway_POVsBL_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot2::ggplot() +
+  geom_gsea(df_Kg_time, linecolor = "darkgreen", zeroline = F, linesize = 1, labelsize = 2) +
+  theme_gsea(7) +
+  labs(title = "KEGGPathway_POVsBL(FDR<=0.1)") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+#dev.off()
+```
+
+
+#  Perform Fast Gene Set Enrichment Analysis (FGSEA) using the Hallmark database
+```{r}
+# prepare ranked gene list for HIGHvsLOW_Both comparison
+ranked_genes_dt <- WTgain_sens_FDR_1_out$logFC
+names(ranked_genes_dt) <-WTgain_sens_FDR_1_out$gene
+
+# Sort genes in decreasing order of logFC
+ranked_genes_dt<- sort(ranked_genes_dt, decreasing = TRUE)
+
+# View the ranked genes
+head(ranked_genes_dt)
+
+# Run fgsea with the hallmark pathways 
+FGSEA_hl_dt <- fgsea(pathways = hallmark , # List of gene sets to check
+                 stats = ranked_genes_dt,
+                  eps = 0,
+                 scoreType = 'std', 
+                 minSize = 15,
+                 maxSize = 250)
+
+#FGSEA_hl_dt$leadingEdge <- sapply(FGSEA_hl_dt$leadingEdge, function(x) paste(x, collapse=",")) #converting each element of Leading Edge into character string
+#write_xlsx(FGSEA_hl_dt, "Fgsea_HallmarkPathway_HighVsLow.xlsx")
+
+# Top 6 enriched pathways (ordered by p-val)
+head(FGSEA_hl_dt[order(pval), ])
+
+sum(FGSEA_hl_dt[, padj < 0.05]) #7 significant pathways 
+
+sum(FGSEA_hl_dt[, pval < 0.05]) # 13 significant pathways
+
+#select top pathways and create a table
+topPathwaysUp_hl_dt <- FGSEA_hl_dt[ES > 0 & padj < 0.05][head(order(padj), n = 5), pathway] # extract top 5 hallmark pathways upregulated at fdr 0.05
+topPathwaysDown_hl_dt <- FGSEA_hl_dt[ES < 0 & padj <0.05][head(order(padj), n =5), pathway] # extract top 5 hallmark pathways downregulated at fdr 0.05
+topPathways_hl_dt <- c(topPathwaysUp_hl_dt, rev(topPathwaysDown_hl_dt))
+plotGseaTable(hallmark[topPathways_hl_dt], stats = ranked_genes_dt, fgseaRes = FGSEA_hl_dt, gseaParam = 0.5)
+
+# remove redundant pathways
+collapsedPathways_hl_dt <- collapsePathways(FGSEA_hl_dt[order(pval)][padj < 0.01], hallmark, ranked_genes_dt, gseaParam = 1)
+
+# plot the most significantly enriched pathway
+plotEnrichment(hallmark[[head(FGSEA_hl_dt[order(padj), ], 1)$pathway]],
+               ranked_genes_dt) + 
+  labs(title = head(FGSEA_hl_dt[order(padj), ], 1)$pathway)
+
+# using gggsea to generate enrichment plots for top pathways (identified from fgsea above)
+
+# call selected pathways file
+setlist_hl_dt = hallmark[topPathways_hl_dt]
+
+# generate data for input into pathway images
+df_hl_dt = gseaCurve(ranked_genes_dt, setlist_hl_dt, FGSEA_hl_dt)
+
+#jpeg("HallmarkPathway_HighVsLow_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot2::ggplot() +
+  geom_gsea(df_hl_dt, linecolor = "darkgreen", linesize = 1, labelsize = 2) +
+  theme_gsea(7) +
+  labs(title = "HallmarkPathway_HighVsLow(FDR<=0.05)") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+#dev.off()
+```
+
+
+# Perform Fast Gene Set Enrichment Analysis (FGSEA) using the Wiki database
+```{r}
+# Run fgsea with the wiki pathways 
+FGSEA_Wk_dt <- fgsea(pathways = Wiki , # List of gene sets to check
+                 stats = ranked_genes_dt,
+                  eps = 0,
+                 scoreType = 'std', 
+                 minSize = 15,
+                 maxSize = 250)
+
+#FGSEA_Wk_dt$leadingEdge <- sapply(FGSEA_Wk_dt$leadingEdge, function(x) paste(x, collapse=",")) #converting each element of Leading Edge into character string
+#write_xlsx(FGSEA_Wk_dt, "Fgsea_WikiPathway_HighVsLow.xlsx")
+
+# Top 6 enriched pathways (ordered by p-val)
+head(FGSEA_Wk_dt[order(pval), ])
+
+sum(FGSEA_Wk_dt[, padj < 0.05]) # 16 significant pathways 
+
+sum(FGSEA_Wk_dt[, pval < 0.05]) # 66 significant pathways
+
+#select top pathways and create a table
+topPathwaysUp_Wk_dt <- FGSEA_Wk_dt[ES > 0 & padj <= 0.05][head(order(padj), n =5), pathway] # extract top 5 upregulated wiki pathways at fdr 0.05
+topPathwaysDown_Wk_dt <- FGSEA_Wk_dt[ES < 0 & padj <= 0.05][head(order(padj), n = 5), pathway] # extract top 5 downregulated wiki pathways at fdr 0.05
+topPathways_wk_dt <- c(topPathwaysUp_Wk_dt, rev(topPathwaysDown_Wk_dt))
+plotGseaTable(Wiki[topPathways_wk_dt], stats = ranked_genes_dt, fgseaRes = FGSEA_Wk_dt, colwidths = c(5,3,0.8,1,1), gseaParam = 0.5)
+
+# remove redundant pathways
+collapsedPathways_wk_dt <- collapsePathways(FGSEA_Wk_dt[order(pval)][padj < 0.01], Wiki, ranked_genes_dt, gseaParam = 1)
+mainPathways_wk_dt <- FGSEA_Wk_dt[pathway %in% collapsedPathways_wk_dt$mainPathways][order(-NES), pathway]
+plotGseaTable(Wiki[mainPathways_wk_dt], ranked_genes_dt, FGSEA_Wk_dt, gseaParam = 0.5)
+
+
+# plot the most significantly enriched pathway
+plotEnrichment(Wiki[[head(FGSEA_Wk_dt[order(padj), ], 1)$pathway]],
+               ranked_genes_dt ) + 
+  labs(title = head(FGSEA_Wk_dt[order(padj), ], 1)$pathway) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"))
+
+# using gggsea to generate enrichment plots for top pathways (identified from fgsea above)
+
+# call selected pathways file
+setlist_Wk_dt = Wiki[topPathways_wk_dt]
+
+# generate data for input into pathway images
+df_wk_dt = gseaCurve(ranked_genes_dt, setlist_Wk_dt, FGSEA_Wk_dt)
+
+#jpeg("WikiPathway_HighVsLow_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot2::ggplot() +
+  geom_gsea(df_wk_dt, linecolor = "darkgreen", linesize = 1, labelsize = 2) +
+  theme_gsea(7) +
+    labs(title = "WikiPathway_HighVsLow(FDR<=0.05)") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+#dev.off()
+```
+
+
+# Perform Fast Gene Set Enrichment Analysis (FGSEA) using the KEGG database
+```{r}
+# Run fgsea with the pathways 
+FGSEA_Kg_dt <- fgsea(pathways = kegg , # List of gene sets to check
+                 stats = ranked_genes_dt,
+                  eps = 0,
+                 scoreType = 'std', 
+                 minSize = 15,
+                 maxSize = 250)
+
+#FGSEA_Kg_dt$leadingEdge <- sapply(FGSEA_Kg_dt$leadingEdge, function(x) paste(x, collapse=",")) #converting each element of Leading Edge into character string
+#write_xlsx(FGSEA_Kg_dt, "Fgsea_KEGGPathway_HighVsLow.xlsx")
+
+# Top 6 enriched pathways (ordered by p-val)
+head(FGSEA_Kg_dt[order(pval), ])
+
+sum(FGSEA_Kg_dt[, padj < 0.05]) #22 significant pathways
+
+sum(FGSEA_Kg_dt[, pval < 0.05]) #40 significant pathways
+
+#select top pathways and create a table
+topPathwaysUp_kg_dt <- FGSEA_Kg_dt[ES > 0 & padj < 0.05][head(order(padj), n =5), pathway] #extract top 5 upregulated kegg pathways at fdr 0.05
+topPathwaysDown_kg_dt <- FGSEA_Kg_dt[ES < 0 & padj < 0.05][head(order(padj), n = 5), pathway] # extract top 5 dowregulated kegg pathways at fdr 0.05
+topPathways_kg_dt <- c(topPathwaysUp_kg_dt, rev(topPathwaysDown_kg_dt))
+plotGseaTable(kegg[topPathways_kg_dt], stats = ranked_genes_dt, fgseaRes = FGSEA_Kg_dt, colwidths = c(5,3,0.8,1,1), gseaParam = 0.5)
+
+# remove redundant pathways
+collapsedPathways_kg_dt <- collapsePathways(FGSEA_Kg_dt[order(pval)][padj < 0.01], kegg, ranked_genes_dt, gseaParam = 1)
+mainPathways_kg_dt <- FGSEA_Kg_dt[pathway %in% collapsedPathways_kg_dt$mainPathways][order(-NES), pathway]
+plotGseaTable(kegg[mainPathways_kg_dt], ranked_genes_dt, FGSEA_Kg_dt, gseaParam = 0.5)
+
+
+# plot the most significantly enriched pathway
+plotEnrichment(kegg[[head(FGSEA_Kg_dt[order(padj), ], 1)$pathway]],
+               ranked_genes_dt ) + 
+  labs(title = head(FGSEA_Kg_dt[order(padj), ], 1)$pathway) +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 14, face = "bold"))
+
+# using gggsea to generate enrichment plots for top pathways (identified from fgsea above)
+
+# call selected pathways file
+setlist_kg_dt = kegg[topPathways_kg_dt]
+
+# generate data for input into pathway images
+df_kg_dt = gseaCurve(ranked_genes_dt, setlist_kg_dt, FGSEA_Kg_dt)
+
+#jpeg("KEGGpathway_HighVsLow_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot2::ggplot() +
+  geom_gsea(df_kg_dt, linecolor = "darkgreen", linesize = 1, labelsize = 2) +
+  theme_gsea(7) +
+    labs(title = "KEGGPathway_HighVsLow(FDR<=0.05)") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+
+#dev.off()
+```
+#Perform Fast Gene Set Enrichment Analysis (FGSEA) using the Hallmark database
+```{r}
+## Fgsea - HIGHvsLOW_BL comparison - Hallmark Pathways
+
+# prepare ranked gene list for HIGHvsLOW_BL comparison
+ranked_genes_bl <- BL_diff_FDR_1_out$logFC
+names(ranked_genes_bl) <-BL_diff_FDR_1_out$gene
+
+# Sort genes in decreasing order of logFC
+ranked_genes_bl <- sort(ranked_genes_bl, decreasing = TRUE)
+
+# View the ranked genes
+head(ranked_genes_bl)
+
+# Run fgsea with the pathways 
+FGSEA_hl_bl <- fgsea(pathways = hallmark , # List of gene sets to check
+                 stats = ranked_genes_bl,
+                  eps = 0,
+                 scoreType = 'std', 
+                 minSize = 15,
+                 maxSize = 250)
+
+#FGSEA_hl_bl$leadingEdge <- sapply(FGSEA_hl_bl$leadingEdge, function(x) paste(x, collapse=",")) #converting each element of Leading Edge into character string
+
+#select top pathways and create a table
+topPathwaysUp_hl_bl <- FGSEA_hl_bl[ES > 0 & pval < 0.01][head(order(pval), n = 5), pathway] #extract top 5 upregulated hallmark pathways at p.val 0.01
+topPathwaysDown_hl_bl <- FGSEA_hl_bl[ES < 0 & pval <0.01][head(order(pval), n =5), pathway] #extract top 5 downregulated hallmark pathways at p.val 0.01
+topPathways_hl_bl <- c(topPathwaysUp_hl_bl, rev(topPathwaysDown_hl_bl))
+plotGseaTable(hallmark[topPathways_hl_bl], stats = ranked_genes_bl, fgseaRes = FGSEA_hl_bl, gseaParam = 0.5)
+
+# remove redundant pathways
+collapsedPathways_hl_bl <- collapsePathways(FGSEA_hl_bl[order(pval)][pval < 0.01], hallmark, ranked_genes_bl, gseaParam = 1) 
+
+# plot the most significantly enriched pathway
+plotEnrichment(hallmark[[head(FGSEA_hl_bl[order(pval), ], 1)$pathway]],
+               ranked_genes_bl) + 
+  labs(title = head(FGSEA_hl_bl[order(pval), ], 1)$pathway)
+
+# using gggsea to generate enrichment plots for top pathways (identified from fgsea above)
+
+# call selected pathways file
+setlist_hl_bl = hallmark[topPathways_hl_bl]
+
+# generate data for input into pathway images
+df_hl_bl = gseaCurve(ranked_genes_bl, setlist_hl_bl, FGSEA_hl_bl)
+
+#jpeg("HallmarkPathway_HIGHVsLOW_BL_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot2::ggplot() +
+  geom_gsea(df_hl_bl, linecolor = "darkgreen", zeroline = F, linesize = 1, labelsize = 2) +
+  theme_gsea(7) +
+  labs(title = "HallmarkPathway_HIGHVsLOW_BL(P.Val <=0.01)") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+#dev.off()
+
+#library(openxlsx)
+#wb <- loadWorkbook("out_fgsea_HighVsLow_unpaired_110124.xlsx")
+#addWorksheet(wb, "Hallmark_BLDiff")
+#writeData(wb, "Hallmark_BLDiff", FGSEA_hl_bl)
+#saveWorkbook(wb, "out_fgsea_HighVsLow_unpaired_110124.xlsx", overwrite = T)
+
+# Perform Fast Gene Set Enrichment Analysis (FGSEA) using the Wiki database
+## Run fgsea on wikipathways 
+FGSEA_wk_bl <- fgsea(pathways = Wiki , # List of gene sets to check
+                 stats = ranked_genes_bl,
+                  eps = 0,
+                 scoreType = 'std', 
+                 minSize = 15,
+                 maxSize = 250)
+
+#FGSEA_wk_bl$leadingEdge <- sapply(FGSEA_wk_bl$leadingEdge, function(x) paste(x, collapse=",")) #converting each element of Leading Edge into character string
+
+#select top pathways and create a table
+topPathwaysUp_wk_bl <- FGSEA_wk_bl[ES > 0 & pval < 0.01][head(order(pval), n = 5), pathway] # extract top 5 upregulated wiki pathways at p.val 0.01
+topPathwaysDown_wk_bl <- FGSEA_wk_bl[ES < 0 & pval <0.01][head(order(pval), n =5), pathway] # exract top 5 downregulated wiki pathways at p.val 0.01
+topPathways_wk_bl <- c(topPathwaysUp_wk_bl, rev(topPathwaysDown_wk_bl))
+plotGseaTable(Wiki[topPathways_wk_bl], stats = ranked_genes_bl, fgseaRes = FGSEA_wk_bl, gseaParam = 0.5)
+
+# remove redundant pathways
+collapsedPathways_wk_bl <- collapsePathways(FGSEA_wk_bl[order(pval)][pval < 0.01], hallmark, ranked_genes_bl, gseaParam = 1) 
+mainPathways_wk_bl <- FGSEA_wk_bl[pathway %in% collapsedPathways_wk_bl$mainPathways][order(-NES), pathway]
+plotGseaTable(Wiki[mainPathways_wk_bl], ranked_genes_bl, FGSEA_wk_bl, gseaParam = 0.5)
+
+# plot the most significantly enriched pathway
+plotEnrichment(Wiki[[head(FGSEA_wk_bl[order(pval), ], 1)$pathway]],
+               ranked_genes_bl) + 
+  labs(title = head(FGSEA_wk_bl[order(pval), ], 1)$pathway)
+
+# using gggsea to generate enrichment plots for top pathways (identified from fgsea above)
+
+# call selected pathways file
+setlist_wk_bl = Wiki[topPathways_wk_bl]
+
+# generate data for input into pathway images
+df_wk_bl = gseaCurve(ranked_genes_bl, setlist_wk_bl, FGSEA_wk_bl)
+
+#jpeg("WikiPathway_HIGHVsLOW_BL_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot2::ggplot() +
+  geom_gsea(df_wk_bl, linecolor = "darkgreen", zeroline = F, linesize = 1, labelsize = 2) +
+  theme_gsea(7) +
+  labs(title = "WikiPathway_HIGHVsLOW_BL(P.Val <=0.01)") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+#dev.off()
+
+#addWorksheet(wb, "Wiki_BLDiff")
+#writeData(wb, "Wiki_BLDiff", FGSEA_wk_bl)
+
+# Perform Fast Gene Set Enrichment Analysis (FGSEA) using the KEGG database
+
+## Run fgsea on kegg pathways
+FGSEA_Kg_bl <- fgsea(pathways = kegg , # List of gene sets to check
+                 stats = ranked_genes_bl,
+                  eps = 0,
+                 scoreType = 'std', 
+                 minSize = 15,
+                 maxSize = 250)
+
+#FGSEA_Kg_bl$leadingEdge <- sapply(FGSEA_Kg_bl$leadingEdge, function(x) paste(x, collapse=",")) #converting each element of Leading Edge into character string
+
+#select top pathways and create a table
+topPathwaysUp_Kg_bl <- FGSEA_Kg_bl[ES > 0 & pval < 0.01][head(order(pval), n = 5), pathway] # extract top 5 uregulated kegg pathways at p.val 0.01
+topPathwaysDown_Kg_bl <- FGSEA_Kg_bl[ES < 0 & pval <0.01][head(order(pval), n =5), pathway] # extract top 5 downregulated kegg pathways at p.val 0.01
+topPathways_Kg_bl <- c(topPathwaysUp_Kg_bl, rev(topPathwaysDown_Kg_bl))
+plotGseaTable(kegg[topPathways_Kg_bl], stats = ranked_genes_bl, fgseaRes = FGSEA_Kg_bl, gseaParam = 0.5)
+
+
+# remove redundant pathways
+collapsedPathways_kg_bl <- collapsePathways(FGSEA_Kg_bl[order(pval)][pval < 0.01], kegg, ranked_genes_bl, gseaParam = 1)
+mainPathways_kg_bl <- FGSEA_Kg_bl[pathway %in% collapsedPathways_kg_bl$mainPathways][order(-NES), pathway]
+plotGseaTable(kegg[mainPathways_kg_bl], ranked_genes_bl, FGSEA_Kg_bl, gseaParam = 0.5)
+
+
+# plot the most significantly enriched pathway
+plotEnrichment(kegg[[head(FGSEA_Kg_bl[order(pval), ], 1)$pathway]],
+               ranked_genes_bl) + 
+  labs(title = head(FGSEA_Kg_bl[order(pval), ], 1)$pathway)
+
+# using gggsea to generate enrichment plots for top pathways (identified from fgsea above)
+
+# call selected pathways file
+setlist_Kg_bl = kegg[topPathways_Kg_bl]
+
+# generate data for input into pathway images
+df_Kg_bl = gseaCurve(ranked_genes_bl, setlist_Kg_bl, FGSEA_Kg_bl)
+
+#jpeg("KEGGPathway_HIGHVsLOW_BL_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot2::ggplot() +
+  geom_gsea(df_Kg_bl, linecolor = "darkgreen", zeroline = F, linesize = 1, labelsize = 2) +
+  theme_gsea(7) +
+  labs(title = "KEGGPathway_HIGHVsLOW_BL(P.Val <=0.01)") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+#dev.off()
+
+#addWorksheet(wb, "KEGG_BLDiff")
+#writeData(wb, "KEGG_BLDiff", FGSEA_Kg_bl)
+
+```
+
+# Perform Fast Gene Set Enrichment Analysis (FGSEA) using the Hallmark database
+```{r}
+## Fgsea - HIGHvsLOW_PO comparison - Hallmark Pathways
+
+# prepare ranked gene list for HIGHvsLOW_PO comparison
+ranked_genes_PO <- PO_diff_FDR_1_out$logFC
+names(ranked_genes_PO) <-PO_diff_FDR_1_out$gene
+
+# Sort genes in decreasing order of logFC
+ranked_genes_PO <- sort(ranked_genes_PO, decreasing = TRUE)
+
+# View the ranked genes
+head(ranked_genes_PO)
+
+# Run fgsea with the pathways 
+FGSEA_hl_po <- fgsea(pathways = hallmark , # List of gene sets to check
+                 stats = ranked_genes_PO,
+                  eps = 0,
+                 scoreType = 'std', 
+                 minSize = 15,
+                 maxSize = 250)
+
+#FGSEA_hl_po$leadingEdge <- sapply(FGSEA_hl_po$leadingEdge, function(x) paste(x, collapse=",")) #converting each element of Leading Edge into character string
+
+#select top pathways and create a table
+topPathwaysUp_hl_po <- FGSEA_hl_po[ES > 0 & pval < 0.01][head(order(pval), n = 5), pathway] # extract top 5 upregulated hallmark pathways at p.val 0.01
+topPathwaysDown_hl_po <- FGSEA_hl_po[ES < 0 & pval <0.01][head(order(pval), n =5), pathway] # extract top 5 downregulated hallmark pathway at p.val 0.01
+topPathways_hl_po <- c(topPathwaysUp_hl_po, rev(topPathwaysDown_hl_po))
+plotGseaTable(hallmark[topPathways_hl_po], stats = ranked_genes_PO, fgseaRes = FGSEA_hl_po, gseaParam = 0.5)
+
+
+# remove redundant pathways
+collapsedPathways_hl_po <- collapsePathways(FGSEA_hl_po[order(pval)][pval < 0.01], hallmark, ranked_genes_PO, gseaParam = 1)
+
+# plot the most significantly enriched pathway
+plotEnrichment(hallmark[[head(FGSEA_hl_po[order(pval), ], 1)$pathway]],
+               ranked_genes_PO) + 
+  labs(title = head(FGSEA_hl_po[order(pval), ], 1)$pathway)
+
+# using gggsea to generate enrichment plots for top pathways (identified from fgsea above)
+
+# call selected pathways file
+setlist_hl_po = hallmark[topPathways_hl_po]
+
+# generate data for input into pathway images
+df_hl_po = gseaCurve(ranked_genes_PO, setlist_hl_po, FGSEA_hl_po)
+
+#jpeg("HallmarkPathway_HIGHVsLOW_PO_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot2::ggplot() +
+  geom_gsea(df_hl_po, linecolor = "darkgreen", zeroline = F, linesize = 1, labelsize = 2) +
+  theme_gsea(7) +
+  labs(title = "HallmarkPathway_HIGHVsLOW_PO(P.Val <=0.01)") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+#dev.off()
+
+
+#library(openxlsx)
+#wb <- loadWorkbook("out_fgsea_HighVsLow_unpaired_110124.xlsx")
+#addWorksheet(wb, "Hallmark_PODiff")
+#writeData(wb, "Hallmark_PODiff", FGSEA_hl_po)
+#saveWorkbook(wb, "out_fgsea_HighVsLow_unpaired_110124.xlsx", overwrite = T)
+
+# Perform Fast Gene Set Enrichment Analysis (FGSEA) using the Wiki database
+
+## Run fgsea on wikipathways
+FGSEA_wk_po <- fgsea(pathways = Wiki , # List of gene sets to check
+                 stats = ranked_genes_PO,
+                  eps = 0,
+                 scoreType = 'std', 
+                 minSize = 15,
+                 maxSize = 250)
+
+#FGSEA_wk_po$leadingEdge <- sapply(FGSEA_wk_po$leadingEdge, function(x) paste(x, collapse=",")) #converting each element of Leading Edge into character string
+
+#select top pathways and create a table
+topPathwaysUp_wk_po <- FGSEA_wk_po[ES > 0 & pval < 0.01][head(order(pval), n = 5), pathway] #extract top 5 upreg wiki pathways at p.val 0.01
+topPathwaysDown_wk_po <- FGSEA_wk_po[ES < 0 & pval <0.01][head(order(pval), n =5), pathway] #extract top 5 downreg wiki pathways at p.val 0.01
+topPathways_wk_po <- c(topPathwaysUp_wk_po, rev(topPathwaysDown_wk_po))
+plotGseaTable(Wiki[topPathways_wk_po], stats = ranked_genes_PO, fgseaRes = FGSEA_wk_po, gseaParam = 0.5)
+
+# remove redundant pathways
+collapsedPathways_wk_po <- collapsePathways(FGSEA_wk_po[order(pval)][pval < 0.01], Wiki, ranked_genes_PO, gseaParam = 1)
+mainPathways_wk_po <- FGSEA_wk_po[pathway %in% collapsedPathways_wk_po$mainPathways][order(-NES), pathway]
+plotGseaTable(Wiki[mainPathways_wk_po], ranked_genes_PO, FGSEA_wk_po, gseaParam = 0.5)
+
+
+# plot the most significantly enriched pathway
+plotEnrichment(Wiki[[head(FGSEA_wk_po[order(pval), ], 1)$pathway]],
+               ranked_genes_PO) + 
+  labs(title = head(FGSEA_wk_po[order(pval), ], 1)$pathway)
+
+# using gggsea to generate enrichment plots for top pathways (identified from fgsea above)
+
+# call selected pathways file
+setlist_wk_po = Wiki[topPathways_wk_po]
+
+# generate data for input into pathway images
+df_wk_po = gseaCurve(ranked_genes_PO, setlist_wk_po, FGSEA_wk_po)
+
+#jpeg("WikiPathway_HIGHVsLOW_PO_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot2::ggplot() +
+  geom_gsea(df_wk_po, linecolor = "darkgreen", zeroline = F, linesize = 1, labelsize = 2) +
+  theme_gsea(7) +
+  labs(title = "WikiPathway_HIGHVsLOW_PO(P.Val <=0.01)") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+#dev.off()
+
+
+#addWorksheet(wb, "Wiki_PODiff")
+#writeData(wb, "Wiki_PODiff", FGSEA_wk_po)
+
+ #Perform Fast Gene Set Enrichment Analysis (FGSEA) using the KEGG database
+
+## Run fgsea on kegg pathways
+FGSEA_Kg_po <- fgsea(pathways = kegg , # List of gene sets to check
+                 stats = ranked_genes_PO,
+                  eps = 0,
+                 scoreType = 'std', 
+                 minSize = 15,
+                 maxSize = 250)
+
+#FGSEA_Kg_po$leadingEdge <- sapply(FGSEA_Kg_po$leadingEdge, function(x) paste(x, collapse=",")) #converting each element of Leading Edge into character string
+
+#select top pathways and create a table
+topPathwaysUp_Kg_po <- FGSEA_Kg_po[ES > 0 & pval < 0.01][head(order(pval), n = 5), pathway] # extract top 5 upregulated kegg pathways at pval 0.01
+topPathwaysDown_Kg_po <- FGSEA_Kg_po[ES < 0 & pval <0.01][head(order(pval), n =5), pathway] # extract top 5 downregulated kegg pathways at pval 0.01
+topPathways_Kg_po <- c(topPathwaysUp_Kg_po, rev(topPathwaysDown_Kg_po))
+plotGseaTable(kegg[topPathways_Kg_po], stats = ranked_genes_PO, fgseaRes = FGSEA_Kg_po, gseaParam = 0.5)
+
+# remove redundant pathways
+collapsedPathways_kg_po <- collapsePathways(FGSEA_Kg_po[order(pval)][pval < 0.01], kegg, ranked_genes_PO, gseaParam = 1)
+mainPathways_kg_po <- FGSEA_Kg_po[pathway %in% collapsedPathways_kg_po$mainPathways][order(-NES), pathway]
+plotGseaTable(kegg[mainPathways_kg_po], ranked_genes_PO, FGSEA_Kg_po, gseaParam = 0.5)
+
+
+# plot the most significantly enriched pathway
+plotEnrichment(kegg[[head(FGSEA_Kg_po[order(pval), ], 1)$pathway]],
+               ranked_genes_PO) + 
+  labs(title = head(FGSEA_Kg_po[order(pval), ], 1)$pathway)
+
+# using gggsea to generate enrichment plots for top pathways (identified from fgsea above)
+
+# call selected pathways file
+setlist_Kg_po = kegg[topPathways_Kg_po]
+
+# generate data for input into pathway images
+df_Kg_po = gseaCurve(ranked_genes_PO, setlist_Kg_po, FGSEA_Kg_po)
+
+#jpeg("KEGGPathway_HIGHVsLOW_PO_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot2::ggplot() +
+  geom_gsea(df_Kg_po, linecolor = "darkgreen", zeroline = F, linesize = 1, labelsize = 2) +
+  theme_gsea(7) +
+  labs(title = "KEGGPathway_HIGHVsLOW_PO(P.Val <=0.01)") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+#dev.off()
+
+#addWorksheet(wb, "KEGG_PODiff")
+#writeData(wb, "KEGG_PODiff", FGSEA_Kg_po)
+
+
+```
+
+# Perform Fast Gene Set Enrichment Analysis (FGSEA) using the Hallmark database
+```{r}
+
+## Fgsea - HIGHvsLOW_Intxn comparison - Hallmark Pathways
+
+# prepare ranked gene list for HIGHvsLOW_Intxn comparison
+ranked_genes_int <- Int_FDR_1_out$logFC
+names(ranked_genes_int) <-Int_FDR_1_out$gene
+
+# Sort genes in decreasing order of logFC
+ranked_genes_int <- sort(ranked_genes_int, decreasing = TRUE)
+
+# View the ranked genes
+head(ranked_genes_int)
+
+# Run fgsea with the pathways 
+FGSEA_hl_int <- fgsea(pathways = hallmark , # List of gene sets to check
+                 stats = ranked_genes_int,
+                  eps = 0,
+                 scoreType = 'std', 
+                 minSize = 15,
+                 maxSize = 250)
+
+#FGSEA_hl_int$leadingEdge <- sapply(FGSEA_hl_int$leadingEdge, function(x) paste(x, collapse=",")) #converting each element of Leading Edge into character string
+
+#select top pathways and create a table
+topPathwaysUp_hl_int <- FGSEA_hl_int[ES > 0 & pval < 0.01][head(order(pval), n = 5), pathway] # extract top 5 upreg hallmark pathways at p.val 0.01
+topPathwaysDown_hl_int <- FGSEA_hl_int[ES < 0 & pval <0.01][head(order(pval), n =5), pathway] #exract top 5 downreg hallmark pathways at p.val 0.01
+topPathways_hl_int <- c(topPathwaysUp_hl_int, rev(topPathwaysDown_hl_int))
+plotGseaTable(hallmark[topPathways_hl_int], stats = ranked_genes_int, fgseaRes = FGSEA_hl_int, gseaParam = 0.5)
+
+
+# remove redundant pathways
+collapsedPathways_hl_int <- collapsePathways(FGSEA_hl_int[order(pval)][pval < 0.01], hallmark, ranked_genes_int, gseaParam = 1) 
+
+# plot the most significantly enriched pathway
+plotEnrichment(hallmark[[head(FGSEA_hl_int[order(pval), ], 1)$pathway]],
+               ranked_genes_int) + 
+  labs(title = head(FGSEA_hl_int[order(pval), ], 1)$pathway)
+
+# using gggsea to generate enrichment plots for top pathways (identified from fgsea above)
+
+# call selected pathways file
+setlist_hl_int = hallmark[topPathways_hl_int]
+
+# generate data for input into pathway images
+df_hl_int = gseaCurve(ranked_genes_int, setlist_hl_int, FGSEA_hl_int)
+
+#jpeg("HallmarkPathway_HIGHVsLOW_Intxn_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot2::ggplot() +
+  geom_gsea(df_hl_int, linecolor = "darkgreen", zeroline = F, linesize = 1, labelsize = 2) +
+  theme_gsea(7) +
+  labs(title = "HallmarkPathway_HIGHVsLOW_Intxn(P.Val <=0.01)") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+#dev.off()
+
+#library(openxlsx)
+#wb <- loadWorkbook("out_fgsea_HighVsLow_unpaired_110124.xlsx")
+#addWorksheet(wb, "Hallmark_INT")
+#writeData(wb, "Hallmark_INT", FGSEA_hl_int)
+#saveWorkbook(wb, "out_fgsea_HighVsLow_unpaired_110124.xlsx", overwrite = T)
+
+# Perform Fast Gene Set Enrichment Analysis (FGSEA) using the Wiki database
+
+## Run fgsea on wikipathways 
+FGSEA_wk_int <- fgsea(pathways = Wiki , # List of gene sets to check
+                 stats = ranked_genes_int,
+                  eps = 0,
+                 scoreType = 'std', 
+                 minSize = 15,
+                 maxSize = 250)
+
+#FGSEA_wk_int$leadingEdge <- sapply(FGSEA_wk_int$leadingEdge, function(x) paste(x, collapse=",")) #converting each element of Leading Edge into character string
+
+#select top pathways and create a table
+topPathwaysUp_wk_int <- FGSEA_wk_int[ES > 0 & pval < 0.01][head(order(pval), n = 5), pathway] #extarct top 5 upreg wiki pathways at p.val 0.01
+topPathwaysDown_wk_int <- FGSEA_wk_int[ES < 0 & pval <0.01][head(order(pval), n =5), pathway] # extract top 5 downreg wiki pathways at p.val 0.01
+topPathways_wk_int <- c(topPathwaysUp_wk_int, rev(topPathwaysDown_wk_int))
+plotGseaTable(Wiki[topPathways_wk_int], stats = ranked_genes_int, fgseaRes = FGSEA_wk_int, gseaParam = 0.5)
+
+# remove redundant pathways
+collapsedPathways_wk_int <- collapsePathways(FGSEA_wk_int[order(pval)][pval < 0.01], Wiki, ranked_genes_int, gseaParam = 1)
+mainPathways_wk_int <- FGSEA_wk_int[pathway %in% collapsedPathways_wk_int$mainPathways][order(-NES), pathway]
+plotGseaTable(Wiki[mainPathways_wk_int], ranked_genes_int, FGSEA_wk_int, gseaParam = 0.5)
+
+
+# plot the most significantly enriched pathway
+plotEnrichment(Wiki[[head(FGSEA_wk_int[order(pval), ], 1)$pathway]],
+               ranked_genes_int) + 
+  labs(title = head(FGSEA_wk_int[order(pval), ], 1)$pathway)
+
+# using gggsea to generate enrichment plots for top pathways (identified from fgsea above)
+
+# call selected pathways file
+setlist_wk_int = Wiki[topPathways_wk_int]
+
+# generate data for input into pathway images
+df_wk_int = gseaCurve(ranked_genes_int, setlist_wk_int, FGSEA_wk_int)
+
+#jpeg("WikiPathway_HIGHVsLOW_Intxn_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot2::ggplot() +
+  geom_gsea(df_wk_int, linecolor = "darkgreen", zeroline = F, linesize = 1, labelsize = 2) +
+  theme_gsea(7) +
+  labs(title = "WikiPathway_HIGHVsLOW_Intxn(P.Val <=0.01)") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+#dev.off()
+
+#addWorksheet(wb, "Wiki_INT")
+#writeData(wb, "Wiki_INT", FGSEA_wk_int)
+
+# Perform Fast Gene Set Enrichment Analysis (FGSEA) using the KEGG database
+
+## Run fgsea on kegg pathways
+FGSEA_Kg_int <- fgsea(pathways = kegg , # List of gene sets to check
+                 stats = ranked_genes_int,
+                  eps = 0,
+                 scoreType = 'std', 
+                 minSize = 15,
+                 maxSize = 250)
+
+#FGSEA_Kg_int$leadingEdge <- sapply(FGSEA_Kg_int$leadingEdge, function(x) paste(x, collapse=",")) #converting each element of Leading Edge into character string
+
+#select top pathways and create a table
+topPathwaysUp_Kg_int <- FGSEA_Kg_int[ES > 0 & pval < 0.01][head(order(pval), n = 5), pathway] #extract top 5 upreg kegg pathways at p.val 0.01
+topPathwaysDown_Kg_int <- FGSEA_Kg_int[ES < 0 & pval <0.01][head(order(pval), n =5), pathway] # extract top  downreg kegg pathways at p.val 0.01
+topPathways_Kg_int <- c(topPathwaysUp_Kg_int, rev(topPathwaysDown_Kg_int))
+plotGseaTable(kegg[topPathways_Kg_int], stats = ranked_genes_int, fgseaRes = FGSEA_Kg_int, gseaParam = 0.5)
+
+# remove redundant pathways
+collapsedPathways_kg_int <- collapsePathways(FGSEA_Kg_int[order(pval)][pval < 0.01], kegg, ranked_genes_int, gseaParam = 1)
+mainPathways_kg_int <- FGSEA_Kg_int[pathway %in% collapsedPathways_kg_int$mainPathways][order(-NES), pathway]
+plotGseaTable(kegg[mainPathways_kg_int], ranked_genes_int, FGSEA_Kg_int, gseaParam = 0.5)
+
+
+# plot the most significantly enriched pathway
+plotEnrichment(kegg[[head(FGSEA_Kg_int[order(pval), ], 1)$pathway]],
+               ranked_genes_int) + 
+  labs(title = head(FGSEA_Kg_int[order(pval), ], 1)$pathway)
+
+# using gggsea to generate enrichment plots for top pathways (identified from fgsea above)
+
+# call selected pathways file
+setlist_Kg_int = kegg[topPathways_Kg_int]
+
+# generate data for input into pathway images
+df_Kg_int = gseaCurve(ranked_genes_int, setlist_Kg_int, FGSEA_Kg_int)
+
+#jpeg("KEGGPathway_HIGHVsLOW_Intxn_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot2::ggplot() +
+  geom_gsea(df_Kg_int, linecolor = "darkgreen", zeroline = F, linesize = 1, labelsize = 2) +
+  theme_gsea(7) +
+  labs(title = "KEGGPathway_HIGHVsLOW_Intxn (P.Val <=0.01)") +
+  theme(plot.title = element_text(face = "bold", size = 13))
+#dev.off()
+#addWorksheet(wb, "KEGG_INT")
+#writeData(wb, "KEGG_INT", FGSEA_Kg_int)
+
+```
+
+
+
+#Barplot for hallmark pathway - POvsBL_ALL comparison [paired analysis]
+```{r}
+top_pathways_hl_time <- FGSEA_hl_time[pathway %in% topPathways_hl_time][order(padj)] #pull the top pathways from hallmark db
+
+#Barplot for hallmark pathway - time comparison
+
+#jpeg("Barplot_HallmarkPathway_POVsBL_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+
+ggplot(top_pathways_hl_time) +
+  geom_col(aes(
+    x = reorder(pathway, NES),
+    y = NES,
+    fill = -log10(padj)
+  ), color = "black") +
+  coord_flip() +
+  scale_fill_distiller(palette = "Greens", direction = 1) +
+  theme(
+    axis.title = element_text(
+      size = 10,
+      face = "bold",
+      color = "black"
+    ),
+    axis.text = element_text(size = 8, color = "black"),
+    strip.text = element_text(
+      size = 9,
+      color = "black",
+      face = "bold"
+    ),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.line.x = element_line(color="gray30", linetype = "solid")
+  ) +
+  geom_hline (yintercept = 0, color="black", linetype = "solid")+
+  labs(y="Pathway Regulation (NES)", x="Pathway Name", 
+       title="Hallmark pathway database - POVsBL")
+#dev.off()
+
+```
+
+#Barplot for wiki pathway - POvsBL_ALL comparison [paired analysis]
+```{r}
+top_pathways_wk_time <- FGSEA_Wk_time[pathway %in% topPathways_Wk_time][order(padj)] #pull the top pathways from wiki db
+
+# Barplot for wikipathways - time comparison
+
+#jpeg("Barplot_WikiPathway_POVsBL_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot(top_pathways_wk_time) +
+  geom_col(aes(
+    x = reorder(pathway, NES),
+    y = NES,
+    fill = -log10(padj)
+  ), color = "black") +
+  coord_flip() +
+  scale_fill_distiller(palette = "Greens", direction = 1) +
+  theme(
+    axis.title = element_text(
+      size = 10,
+      face = "bold",
+      color = "black"
+    ),
+    axis.text = element_text(size = 8, color = "black"),
+    strip.text = element_text(
+      size = 9,
+      color = "black",
+      face = "bold"
+    ),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.line.x = element_line(color="gray30", linetype = "solid")
+  ) +
+  geom_hline (yintercept = 0, color="black", linetype = "solid")+
+  labs(y="Pathway Regulation (NES)", x="Pathway Name", 
+       title="Wiki pathway database
+        POVsBL")
+#dev.off()
+
+```
+
+
+#Barplot for kegg pathway - POvsBL_ALL comparison [paired analysis]
+```{r}
+top_pathways_kg_time <- FGSEA_Kg_time[pathway %in% topPathways_Kg_time][order(padj)] #pull the top pathways from kegg db
+
+#Barplot for Kegg pathway - time comparison
+
+#jpeg("Barplot_KEGGPathway_POVsBL_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot(top_pathways_kg_time) +
+  geom_col(aes(
+    x = reorder(pathway, NES),
+    y = NES,
+    fill = -log10(padj)
+  ), color = "black") +
+  coord_flip() +
+  scale_fill_distiller(palette = "Greens", direction = 1) +
+  theme(
+    axis.title = element_text(
+      size = 10,
+      face = "bold",
+      color = "black"
+    ),
+    axis.text = element_text(size = 8, color = "black"),
+    strip.text = element_text(
+      size = 9,
+      color = "black",
+      face = "bold"
+    ),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.line.x = element_line(color="gray30", linetype = "solid")
+  ) +
+  geom_hline (yintercept = 0, color="black", linetype = "solid")+
+  labs(y="Pathway Regulation (NES)", x="Pathway Name", 
+       title="KEGG pathway database - POVsBL")
+#dev.off()
+
+```
+
+
+#Barplot for hallmark pathway - HIGHvsLOW_Both comparison [unpaired analysis]
+```{r}
+top_pathways_hl_dt <- FGSEA_hl_dt[pathway %in% topPathways_hl_dt][order(padj)] #pull the top pathways from hallmark db
+
+#Barplot for hallmark pathway 
+
+#jpeg("Barplot_HallmarkPathway_HighVsLow_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+ggplot(top_pathways_hl_dt) +
+  geom_col(aes(
+    x = reorder(pathway, NES),
+    y = NES,
+    fill = -log10(padj)
+  ), color = "black") +
+  coord_flip() +
+  scale_fill_distiller(palette = "Greens", direction = 1) +
+  theme(
+    axis.title = element_text(
+      size = 10,
+      face = "bold",
+      color = "black"
+    ),
+    axis.text = element_text(size = 8, color = "black"),
+    strip.text = element_text(
+      size = 9,
+      color = "black",
+      face = "bold"
+    ),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.line.x = element_line(color="gray30", linetype = "solid")
+  ) +
+  geom_hline (yintercept = 0, color="black", linetype = "solid")+
+  labs(y="Pathway Regulation (NES)", x="Pathway Name", 
+       title="Hallmark pathway database - HighVsLow")
+#dev.off()
+
+```
+
+
+#Barplot for wiki pathway - HIGHvsLOW_Both comparison [unpaired analysis]
+```{r}
+top_pathways_wk_dt <- FGSEA_Wk_dt[pathway %in% topPathways_wk_dt][order(padj)] #pull the top pathways from wiki db
+
+# Barplot for wikipathways
+#jpeg("Barplot_WikiPathway_HighVsLow_Fuentes_Study.jpeg", width = 3000, height = 2000, res = 400)
+ggplot(top_pathways_wk_dt) +
+  geom_col(aes(
+    x = reorder(pathway, NES),
+    y = NES,
+    fill = -log10(padj)
+  ), color = "black") +
+  coord_flip() +
+  scale_fill_distiller(palette = "Greens", direction = 1) +
+  theme(
+    axis.title = element_text(
+      size = 10,
+      face = "bold",
+      color = "black"
+    ),
+    axis.text = element_text(size = 8, color = "black"),
+    strip.text = element_text(
+      size = 9,
+      color = "black",
+      face = "bold"
+    ),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.line.x = element_line(color="gray30", linetype = "solid")
+  ) +
+  geom_hline (yintercept = 0, color="black", linetype = "solid")+
+  labs(y="Pathway Regulation (NES)", x="Pathway Name", 
+       title="Wiki pathway database
+       HighVsLow")
+
+#dev.off()
+```
+
+
+#Barplot for kegg pathway -HIGHvsLOW_Both comparison [unpaired analysis]
+```{r}
+top_pathways_kg_dt <- FGSEA_Kg_dt[pathway %in% topPathways_kg_dt][order(padj)] #pull the top pathways from kegg db
+
+# Barplot for Kegg Pathway 
+#jpeg("Barplot_KEGGPathway_HighVsLow_Fuentes_Study.jpeg", width = 3000, height = 2000, res = 400)
+ggplot(top_pathways_kg_dt) +
+  geom_col(aes(
+    x = reorder(pathway, NES),
+    y = NES,
+    fill = -log10(padj)
+  ), color = "black") +
+  coord_flip() +
+  scale_fill_distiller(palette = "Greens", direction = 1) +
+  theme(
+    axis.title = element_text(
+      size = 10,
+      face = "bold",
+      color = "black"
+    ),
+    axis.text = element_text(size = 8, color = "black"),
+    strip.text = element_text(
+      size = 9,
+      color = "black",
+      face = "bold"
+    ),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.line.x = element_line(color="gray30", linetype = "solid")
+  ) +
+  geom_hline (yintercept = 0, color="black", linetype = "solid")+
+  labs(y="Pathway Regulation (NES)", x="Pathway Name", 
+  title="KEGG pathway database - HighVsLow")
+
+#dev.off()
+```
+
+
+#Barplot for Hallmark, Wiki and KEGG pathways - HIGHvsLOW_BL comparison [unpaired analysis]
+```{r}
+top_pathways_hl_bl <- FGSEA_hl_bl[pathway %in% topPathways_hl_bl][order(pval)] #pull the top pathways from hallmark db
+top_pathways_wk_bl <- FGSEA_wk_bl[pathway %in% topPathways_wk_bl][order(pval)] #top pathways from wiki db
+top_pathways_kg_bl <- FGSEA_Kg_bl[pathway %in% topPathways_Kg_bl][order(pval)] # top pathways from kegg db
+
+#Barplot for hallmark pathway
+
+#jpeg("Barplot_HallmarkPathway_HIGHVsLOW_BL_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+
+ggplot(top_pathways_hl_bl) +
+  geom_col(aes(
+    x = reorder(pathway, NES),
+    y = NES,
+    fill = -log10(pval)
+  ), color = "black") +
+  coord_flip() +
+  scale_fill_distiller(palette = "Greens", direction = 1) +
+  theme(
+    axis.title = element_text(
+      size = 10,
+      face = "bold",
+      color = "black"
+    ),
+    axis.text = element_text(size = 8, color = "black"),
+    strip.text = element_text(
+      size = 9,
+      color = "black",
+      face = "bold"
+    ),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.line.x = element_line(color="gray30", linetype = "solid")
+  ) +
+  geom_hline (yintercept = 0, color="black", linetype = "solid")+
+  labs(y="Pathway Regulation (NES)", x="Pathway Name", 
+       title="Hallmark pathway database - HIGHVsLOW_BL")
+#dev.off()
+
+#Barplot for wiki pathway 
+
+#jpeg("Barplot_WikiPathway_HIGHVsLOW_BL_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+
+ggplot(top_pathways_wk_bl) +
+  geom_col(aes(
+    x = reorder(pathway, NES),
+    y = NES,
+    fill = -log10(pval)
+  ), color = "black") +
+  coord_flip() +
+  scale_fill_distiller(palette = "Greens", direction = 1) +
+  theme(
+    axis.title = element_text(
+      size = 10,
+      face = "bold",
+      color = "black"
+    ),
+    axis.text = element_text(size = 8, color = "black"),
+    strip.text = element_text(
+      size = 9,
+      color = "black",
+      face = "bold"
+    ),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.line.x = element_line(color="gray30", linetype = "solid")
+  ) +
+  geom_hline (yintercept = 0, color="black", linetype = "solid")+
+  labs(y="Pathway Regulation (NES)", x="Pathway Name", 
+       title="Wiki pathway database - 
+       HIGHVsLOW_BL")
+#dev.off()
+
+#Barplot for kegg pathway 
+
+#jpeg("Barplot_KEGGPathway_HIGHVsLOW_BL_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+
+ggplot(top_pathways_kg_bl) +
+  geom_col(aes(
+    x = reorder(pathway, NES),
+    y = NES,
+    fill = -log10(pval)
+  ), color = "black") +
+  coord_flip() +
+  scale_fill_distiller(palette = "Greens", direction = 1) +
+  theme(
+    axis.title = element_text(
+      size = 10,
+      face = "bold",
+      color = "black"
+    ),
+    axis.text = element_text(size = 8, color = "black"),
+    strip.text = element_text(
+      size = 9,
+      color = "black",
+      face = "bold"
+    ),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.line.x = element_line(color="gray30", linetype = "solid")
+  ) +
+  geom_hline (yintercept = 0, color="black", linetype = "solid")+
+  labs(y="Pathway Regulation (NES)", x="Pathway Name", 
+       title="KEGG pathway database - HIGHVsLOW_BL")
+#dev.off()
+```
+
+#Barplot for Hallmark, Wiki and KEGG pathways - HIGHvsLOW_PO comparison [unpaired analysis]
+```{r}
+top_pathways_hl_po <- FGSEA_hl_po[pathway %in% topPathways_hl_po][order(pval)] #pull the top pathways from hallmark db
+top_pathways_wk_po <- FGSEA_wk_po[pathway %in% topPathways_wk_po][order(pval)] #top pathways from wiki db
+top_pathways_kg_po <- FGSEA_Kg_po[pathway %in% topPathways_Kg_po][order(pval)] # top pathways from kegg db
+
+#Barplot for hallmark pathway 
+
+#jpeg("Barplot_HallmarkPathway_HIGHVsLOW_PO_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+
+ggplot(top_pathways_hl_po) +
+  geom_col(aes(
+    x = reorder(pathway, NES),
+    y = NES,
+    fill = -log10(pval)
+  ), color = "black") +
+  coord_flip() +
+  scale_fill_distiller(palette = "Greens", direction = 1) +
+  theme(
+    axis.title = element_text(
+      size = 10,
+      face = "bold",
+      color = "black"
+    ),
+    axis.text = element_text(size = 8, color = "black"),
+    strip.text = element_text(
+      size = 9,
+      color = "black",
+      face = "bold"
+    ),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.line.x = element_line(color="gray30", linetype = "solid")
+  ) +
+  geom_hline (yintercept = 0, color="black", linetype = "solid")+
+  labs(y="Pathway Regulation (NES)", x="Pathway Name", 
+       title="Hallmark pathway database - HIGHVsLOW_PO")
+#dev.off()
+
+#Barplot for wiki pathway 
+
+#jpeg("Barplot_WikiPathway_HIGHVsLOW_PO_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+
+ggplot(top_pathways_wk_po) +
+  geom_col(aes(
+    x = reorder(pathway, NES),
+    y = NES,
+    fill = -log10(pval)
+  ), color = "black") +
+  coord_flip() +
+  scale_fill_distiller(palette = "Greens", direction = 1) +
+  theme(
+    axis.title = element_text(
+      size = 10,
+      face = "bold",
+      color = "black"
+    ),
+    axis.text = element_text(size = 8, color = "black"),
+    strip.text = element_text(
+      size = 9,
+      color = "black",
+      face = "bold"
+    ),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.line.x = element_line(color="gray30", linetype = "solid")
+  ) +
+  geom_hline (yintercept = 0, color="black", linetype = "solid")+
+  labs(y="Pathway Regulation (NES)", x="Pathway Name", 
+       title="Wiki pathway database - 
+       HIGHVsLOW_PO")
+#dev.off()
+
+#Barplot for kegg pathway 
+
+#jpeg("Barplot_KEGGPathway_HIGHVsLOW_PO_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+
+ggplot(top_pathways_kg_po) +
+  geom_col(aes(
+    x = reorder(pathway, NES),
+    y = NES,
+    fill = -log10(pval)
+  ), color = "black") +
+  coord_flip() +
+  scale_fill_distiller(palette = "Greens", direction = 1) +
+  theme(
+    axis.title = element_text(
+      size = 10,
+      face = "bold",
+      color = "black"
+    ),
+    axis.text = element_text(size = 8, color = "black"),
+    strip.text = element_text(
+      size = 9,
+      color = "black",
+      face = "bold"
+    ),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.line.x = element_line(color="gray30", linetype = "solid")
+  ) +
+  geom_hline (yintercept = 0, color="black", linetype = "solid")+
+  labs(y="Pathway Regulation (NES)", x="Pathway Name", 
+       title="KEGG pathway database - HIGHVsLOW_PO")
+#dev.off()
+```
+
+#Barplot for Hallmark, Wiki and KEGG pathways - HIGHvsLOW_Intxn comparison [unpaired analysis]
+```{r}
+top_pathways_hl_int <- FGSEA_hl_int[pathway %in% topPathways_hl_int][order(pval)] #pull the top pathways from hallmark db
+top_pathways_wk_int <- FGSEA_wk_int[pathway %in% topPathways_wk_int][order(pval)] #top pathways from wiki db
+top_pathways_kg_int <- FGSEA_Kg_int[pathway %in% topPathways_Kg_int][order(pval)] # top pathways from kegg db
+
+#Barplot for hallmark pathway
+
+#jpeg("Barplot_HallmarkPathway_HIGHVsLOW_Intxn_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+
+ggplot(top_pathways_hl_int) +
+  geom_col(aes(
+    x = reorder(pathway, NES),
+    y = NES,
+    fill = -log10(pval)
+  ), color = "black") +
+  coord_flip() +
+  scale_fill_distiller(palette = "Greens", direction = 1) +
+  theme(
+    axis.title = element_text(
+      size = 10,
+      face = "bold",
+      color = "black"
+    ),
+    axis.text = element_text(size = 8, color = "black"),
+    strip.text = element_text(
+      size = 9,
+      color = "black",
+      face = "bold"
+    ),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.line.x = element_line(color="gray30", linetype = "solid")
+  ) +
+  geom_hline (yintercept = 0, color="black", linetype = "solid")+
+  labs(y="Pathway Regulation (NES)", x="Pathway Name", 
+       title="Hallmark pathway database - HIGHVsLOW_Intxn")
+#dev.off()
+
+#Barplot for wiki pathway
+
+#jpeg("Barplot_WikiPathway_HIGHVsLOW_Intxn_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+
+ggplot(top_pathways_wk_int) +
+  geom_col(aes(
+    x = reorder(pathway, NES),
+    y = NES,
+    fill = -log10(pval)
+  ), color = "black") +
+  coord_flip() +
+  scale_fill_distiller(palette = "Greens", direction = 1) +
+  theme(
+    axis.title = element_text(
+      size = 10,
+      face = "bold",
+      color = "black"
+    ),
+    axis.text = element_text(size = 8, color = "black"),
+    strip.text = element_text(
+      size = 9,
+      color = "black",
+      face = "bold"
+    ),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.line.x = element_line(color="gray30", linetype = "solid")
+  ) +
+  geom_hline (yintercept = 0, color="black", linetype = "solid")+
+  labs(y="Pathway Regulation (NES)", x="Pathway Name", 
+       title="Wiki pathway database - 
+       HIGHVsLOW_Intxn")
+#dev.off()
+
+#Barplot for kegg pathway
+
+#jpeg("Barplot_KEGGPathway_HIGHVsLOW_Intxn_Fuentes_Study.jpeg", width = 2500, height = 1800, res = 300)
+
+ggplot(top_pathways_kg_int) +
+  geom_col(aes(
+    x = reorder(pathway, NES),
+    y = NES,
+    fill = -log10(pval)
+  ), color = "black") +
+  coord_flip() +
+  scale_fill_distiller(palette = "Greens", direction = 1) +
+  theme(
+    axis.title = element_text(
+      size = 10,
+      face = "bold",
+      color = "black"
+    ),
+    axis.text = element_text(size = 8, color = "black"),
+    strip.text = element_text(
+      size = 9,
+      color = "black",
+      face = "bold"
+    ),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "bottom",
+    axis.line.x = element_line(color="gray30", linetype = "solid")
+  ) +
+  geom_hline (yintercept = 0, color="black", linetype = "solid")+
+  labs(y="Pathway Regulation (NES)", x="Pathway Name", 
+       title="KEGG pathway database - HIGHVsLOW_Intxn")
+#dev.off()
+```

@@ -1,2 +1,2 @@
-# Dr. Galgani Fuentes Study
-This study examines how baseline body composition influences weight and fat mass gain during controlled overfeeding, using advanced techniques to assess energy expenditure and gain resistance
+# EAT/PROOF RNAseq Study (low and high responders)
+This project is regarding the analysis of bulk RNAseq data from high and low weight gain sensitive groups to explore gene expression changes and their impact on adipose tissue function during overfeeding

@@ -243,8 +243,8 @@ kegg_Pval_0.01 <- kegg %>% filter(P-value < 0.01)
 #Plot the filtered hallmark pathways 
 ggplot(hallmark_Pval_0.01) +
   geom_col(aes(
-    x = Odds_Ratio,
-    y = reorder(pathway, Odds_Ratio),
+    x = reorder(Term, Odds_Ratio),
+    y = Odds_Ratio,
     fill = -log10(pvalue)
   ), color = "black") +
   scale_fill_distiller(palette = "Greens", direction = 1) +
@@ -274,8 +274,8 @@ ggplot(hallmark_Pval_0.01) +
 #Plot the filtered wiki pathways 
 ggplot(wiki_Pval_0.01) +
   geom_col(aes(
-    x = Odds_Ratio,
-    y = reorder(pathway, Odds_Ratio),
+    x = reorder(Term, Odds_Ratio),
+    y = Odds_Ratio,
     fill = -log10(pvalue)
   ), color = "black") +
   scale_fill_distiller(palette = "Greens", direction = 1) +
@@ -304,8 +304,8 @@ ggplot(wiki_Pval_0.01) +
 #Plot the filtered KEGG pathways 
 ggplot(kegg_Pval_0.01) +
   geom_col(aes(
-    x = Odds_Ratio,
-    y = reorder(pathway, Odds_Ratio),
+    x =  reorder(Term, Odds_Ratio),
+    y =Odds_Ratio,
     fill = -log10(pvalue)
   ), color = "black") +
   scale_fill_distiller(palette = "Greens", direction = 1) +
